@@ -1,0 +1,423 @@
+# settings.yaml
+# Stage 2 NLP Processing Service Configuration
+# Optimized for 48-core Threadripper, 160GB RAM, RTX A4000 (16GB VRAM)
+
+# =============================================================================
+# GENERAL SETTINGS
+# =============================================================================
+general:
+  log_level: "DEBUG"  # DEBUG for development, INFO for production
+  gpu_enabled: true
+  device: "cuda"  # cuda or cpu
+  max_text_length: 1000000  # Maximum characters per document
+
+# =============================================================================
+# PER-SERVICE GPU OVERRIDES
+# =============================================================================
+# Override GPU settings for specific services to optimize memory usage
+# Event LLM service needs GPU for vLLM optimization (15-25x speedup)
+# NER and DP services can run efficiently on CPU
+per_service_gpu:
+  ner_service:
+    gpu_enabled: false
+    device: "cpu"
+  dp_service:
+    gpu_enabled: false
+    device: "cpu"
+  event_llm_service:
+    gpu_enabled: true
+    device: "cuda"
+
+# =============================================================================
+# DOCUMENT FIELD MAPPING (Stage 1 Integration)
+# =============================================================================
+document_field_mapping:
+  # Primary text field to process from Stage 1 output
+  text_field: "cleaned_text"
+
+  # Fallback fields if primary is missing
+  text_field_fallbacks:
+    - "original_text"
+    - "text"
+    - "content"
+
+  # Context fields to enhance extraction (used in prompts)
+  context_fields:
+    - "cleaned_title"
+    - "cleaned_excerpt"
+    - "cleaned_author"
+    - "cleaned_publication_date"
+    - "cleaned_categories"
+    - "cleaned_tags"
+
+  # Fields to preserve in output (pass-through)
+  preserve_in_output:
+    - "document_id"
+    - "cleaned_publication_date"
+    - "cleaned_source_url"
+    - "cleaned_categories"
+    - "cleaned_tags"
+    - "cleaned_author"
+    - "cleaned_title"
+    - "cleaned_word_count"
+
+# =============================================================================
+# NER SERVICE SETTINGS
+# =============================================================================
+ner_service:
+  port: 8001
+  model_name: "Babelscape/wikineural-multilingual-ner"
+  # Alternative models for consideration:
+  # - "dslim/bert-large-NER"
+  # - "Jean-Baptiste/roberta-large-ner-english"
+  # - "xlm-roberta-large-finetuned-conll03-english"
+
+  batch_size: 16  # GPU batch size for NER inference
+  max_length: 512  # Maximum sequence length for NER model
+
+  # Entity types to extract (ACE 2005 + additional types)
+  entity_types:
+    - "PER"    # Person
+    - "ORG"    # Organization
+    - "LOC"    # Location
+    - "GPE"    # Geopolitical Entity
+    - "DATE"   # Date
+    - "TIME"   # Time
+    - "MONEY"  # Money
+    - "MISC"   # Miscellaneous
+    - "EVENT"  # Event mention
+
+  # Confidence threshold for entity extraction
+  confidence_threshold: 0.75
+
+  # Entity caching settings (for duplicate detection)
+  enable_cache: true
+  cache_ttl_seconds: 3600  # 1 hour
+
+# =============================================================================
+# DEPENDENCY PARSING SERVICE SETTINGS
+# =============================================================================
+dp_service:
+  port: 8002
+  model_name: "en_core_web_trf"  # spaCy transformer model
+  # Alternative: "en_core_web_lg" for faster but less accurate parsing
+
+  batch_size: 8  # GPU batch size for dependency parsing
+
+  # SOA (Subject-Object-Action) extraction settings
+  extract_soa_triplets: true
+  min_triplet_confidence: 0.6
+
+  # Dependency relations to extract
+  dependency_relations:
+    - "nsubj"      # Nominal subject
+    - "nsubjpass"  # Passive nominal subject
+    - "dobj"       # Direct object
+    - "iobj"       # Indirect object
+    - "pobj"       # Object of preposition
+    - "agent"      # Agent
+    - "attr"       # Attribute
+
+# =============================================================================
+# EVENT LLM SERVICE SETTINGS (with vLLM Optimization)
+# =============================================================================
+event_llm_service:
+  port: 8003
+
+  # Model configuration
+  model_name: "mistralai/Mistral-7B-Instruct-v0.3"
+  # Alternatives for consideration (Dec 2025):
+  # - "mistralai/Mistral-Nemo-Instruct-2407" (12B, balanced)
+  # - "meta-llama/Llama-3.1-8B-Instruct" (8B, good quality)
+  # - "Qwen/Qwen2.5-7B-Instruct" (7B, efficient)
+
+  # vLLM settings for optimized inference
+  use_vllm: true
+  tensor_parallel_size: 1  # Set to number of GPUs (1 for single RTX A4000)
+  gpu_memory_utilization: 0.95  # Use 95% of 16GB VRAM (increased from 0.90)
+  max_model_len: 4096  # Maximum context length (reduced from 8192 to fit in VRAM)
+
+  # Quantization for memory efficiency
+  quantization: null  # Options: "awq", "gptq", null for no quantization
+  # AWQ provides better quality than GPTQ at similar speed
+  # NOTE: Disabled quantization since the base model doesn't have AWQ weights
+  dtype: "auto"  # auto, float16, bfloat16
+
+  # Generation parameters
+  max_new_tokens: 4096  # Maximum tokens to generate
+  temperature: 0.1  # Low temperature for more deterministic output
+  top_p: 0.95
+  top_k: 50
+
+  # Chunking strategy for long documents
+  chunk_size_tokens: 2048  # Tokens per chunk
+  chunk_overlap_tokens: 256  # Overlap between chunks to preserve context
+
+  # Batch inference settings
+  max_batch_size: 4  # Process up to 4 documents/chunks simultaneously
+  swap_space_gb: 4  # CPU swap space for vLLM (GB)
+
+  # Event extraction settings
+  extraction_mode: "hierarchical"  # Options: "single_pass", "hierarchical"
+  # Hierarchical: First pass for main events, second pass for details
+
+  # Domain classification for storyline distinction
+  enable_domain_classification: true
+  domains:
+    - "geopolitical_conflict"    # Wars, conflicts, military actions
+    - "diplomatic_relations"     # Treaties, negotiations, meetings
+    - "economic_policy"          # Trade, tariffs, economic partnerships
+    - "domestic_policy"          # Internal policy changes
+    - "elections_politics"       # Electoral events, campaigns
+    - "technology_innovation"    # Tech developments, regulations
+    - "social_movements"         # Protests, social change
+    - "environmental_climate"    # Environmental events, climate policy
+    - "health_pandemic"          # Health crises, medical events
+    - "legal_judicial"           # Court decisions, legal proceedings
+    - "corporate_business"       # Business deals, corporate events
+    - "cultural_entertainment"   # Cultural events, entertainment
+
+  # Event types (ACE 2005 + extended)
+  event_types:
+    - "conflict_attack"
+    - "conflict_demonstrate"
+    - "contact_meet"
+    - "contact_phone_write"
+    - "justice_arrest"
+    - "justice_trial"
+    - "justice_convict"
+    - "life_die"
+    - "life_injure"
+    - "movement_transport"
+    - "personnel_elect"
+    - "personnel_start_position"
+    - "personnel_end_position"
+    - "transaction_transfer_money"
+    - "transaction_transfer_ownership"
+    - "policy_announce"
+    - "policy_implement"
+    - "policy_change"
+    - "agreement_sign"
+    - "agreement_negotiate"
+
+  # Argument roles
+  argument_roles:
+    - "agent"       # Who performed the action
+    - "patient"     # Who/what was affected
+    - "time"        # When it happened
+    - "place"       # Where it happened
+    - "instrument"  # How/with what
+    - "beneficiary" # For whom/what
+    - "purpose"     # Why/for what purpose
+
+# =============================================================================
+# EVENT LINKING & STORYLINE DISTINCTION SETTINGS
+# =============================================================================
+event_linking:
+  # Embedding model for semantic similarity
+  embedding_model: "sentence-transformers/all-mpnet-base-v2"
+  # Alternatives:
+  # - "sentence-transformers/all-MiniLM-L12-v2" (faster, slightly lower quality)
+  # - "BAAI/bge-large-en-v1.5" (higher quality, slower)
+
+  # Multi-dimensional similarity thresholds
+  semantic_similarity_threshold: 0.75  # Cosine similarity for event descriptions
+  entity_overlap_threshold: 0.5  # Minimum entity overlap (Jaccard)
+  temporal_window_days: 7  # Events within N days are candidates for linking
+
+  # Domain-aware linking (prevent cross-domain linking)
+  enforce_domain_boundaries: true
+  allow_cross_domain_linking: false  # Set true to link across domains
+
+  # Storyline distinction settings
+  storyline_clustering:
+    enabled: true
+    min_cluster_size: 2  # Minimum events per storyline
+    # Clustering algorithm: "hdbscan", "agglomerative", "spectral"
+    algorithm: "agglomerative"
+    distance_metric: "multi_dimensional"  # Combines semantic, entity, temporal
+
+    # Weights for multi-dimensional distance
+    weights:
+      semantic: 0.4      # Semantic similarity weight
+      entity: 0.3        # Entity overlap weight
+      temporal: 0.2      # Temporal proximity weight
+      domain: 0.1        # Domain similarity weight
+
+  # Entity-role-context disambiguation
+  # Prevents "Trump + Israel" from conflating with "Trump + Qatar"
+  enable_entity_role_context: true
+  entity_context_window: 50  # Characters around entity for context
+
+  # Causality detection
+  enable_causality_detection: true
+  causality_indicators:
+    - "because"
+    - "due to"
+    - "as a result"
+    - "led to"
+    - "caused"
+    - "triggered"
+    - "following"
+    - "after"
+    - "consequently"
+
+# =============================================================================
+# ORCHESTRATOR SERVICE SETTINGS
+# =============================================================================
+orchestrator_service:
+  port: 8000
+
+  # Processing modes
+  enable_sync_processing: true   # Single document API endpoint
+  enable_async_processing: true  # Batch processing with Celery
+
+  # Batch processing settings
+  batch_processing_chunk_size: 100  # Documents per Celery task
+  max_batch_size: 10000  # Maximum documents in single batch request
+
+  # Service health check settings
+  health_check_interval_seconds: 30
+  health_check_timeout_seconds: 5
+
+  # Request timeout settings
+  ner_service_timeout: 60  # seconds
+  dp_service_timeout: 60
+  event_llm_service_timeout: 300  # 5 minutes for LLM processing
+
+  # Retry settings
+  max_retries: 3
+  retry_backoff_seconds: 2
+
+# =============================================================================
+# CELERY & DASK SETTINGS (Background Processing)
+# =============================================================================
+celery:
+  # Broker and backend
+  broker_url: "redis://redis:6379/0"
+  result_backend: "redis://redis:6379/0"
+
+  # Task settings
+  task_serializer: "json"
+  result_serializer: "json"
+  accept_content:
+    - "json"
+
+  # Task routing
+  task_routes:
+    "src.core.celery_tasks.process_document_task": "nlp_processing"
+    "src.core.celery_tasks.process_batch_task": "nlp_processing"
+
+  # Task time limits
+  task_time_limit: 3600  # 1 hour hard limit
+  task_soft_time_limit: 3000  # 50 minutes soft limit
+
+  # Result expiration
+  result_expires: 86400  # 24 hours
+
+  # Dask cluster settings (for parallel batch processing)
+  dask_enabled: false  # Disabled - GPU models can't be pickled for Dask workers
+  dask_local_cluster_n_workers: 22  # Half of 48 cores
+  dask_local_cluster_threads_per_worker: 1
+  dask_local_cluster_memory_limit: "6GB"  # Per worker
+  dask_cluster_total_memory: "140GB"  # Total available to Dask
+
+# =============================================================================
+# STORAGE SETTINGS
+# =============================================================================
+storage:
+  # Enabled backends (can enable multiple simultaneously)
+  enabled_backends:
+    - "jsonl"
+    # - "postgresql"
+    # - "elasticsearch"
+
+  # JSONL storage configuration
+  jsonl:
+    output_directory: "/app/data"
+    file_prefix: "extracted_events"
+    use_daily_files: true  # Creates separate file per day
+    compression: null  # Options: "gzip", "bz2", null
+    append_mode: true
+
+  # PostgreSQL storage configuration
+  postgresql:
+    host: "postgres"
+    port: 5432
+    database: "nlp_processing"
+    user: "nlp_user"
+    password: "${POSTGRES_PASSWORD}"  # From environment variable
+    table_name: "extracted_events"
+    pool_size: 10
+    max_overflow: 20
+
+    # Schema settings
+    create_table_if_not_exists: true
+    use_jsonb_columns: true  # Store complex fields as JSONB
+
+  # Elasticsearch storage configuration
+  elasticsearch:
+    host: "elasticsearch"
+    port: 9200
+    index_name: "eee_events"
+    use_ssl: false
+    verify_certs: false
+    api_key: "${ELASTICSEARCH_API_KEY}"  # From environment variable
+
+    # Index settings
+    create_index_if_not_exists: true
+    number_of_shards: 3
+    number_of_replicas: 1
+    refresh_interval: "5s"
+
+# =============================================================================
+# CACHING SETTINGS
+# =============================================================================
+caching:
+  # Redis cache for embeddings and intermediate results
+  enabled: true
+  redis_url: "redis://redis:6379/1"  # Different DB from Celery
+
+  # Cache TTL (time-to-live) settings
+  embedding_cache_ttl: 86400  # 24 hours
+  entity_cache_ttl: 3600  # 1 hour
+  event_cache_ttl: 7200  # 2 hours
+
+  # Prompt cache for LLM (vLLM supports this natively)
+  enable_prompt_cache: true
+  prompt_cache_size_mb: 2048  # 2GB for cached prompts
+
+# =============================================================================
+# MONITORING & OBSERVABILITY
+# =============================================================================
+monitoring:
+  # Prometheus metrics
+  enable_metrics: true
+  metrics_port: 9090
+
+  # OpenTelemetry tracing
+  enable_tracing: false  # Set true for distributed tracing
+  tracing_endpoint: "http://jaeger:4318"
+
+  # Health check endpoints
+  enable_health_endpoints: true
+
+  # Logging
+  log_format: "json"  # Options: "json", "text"
+  log_file: "/app/logs/nlp_processing.log"
+  log_rotation: "100MB"
+  log_retention_days: 30
+
+# =============================================================================
+# DEVELOPMENT SETTINGS
+# =============================================================================
+development:
+  # Hot reload for development
+  reload_on_change: false
+
+  # Debug mode
+  debug: false
+
+  # Sample data settings
+  use_sample_data: false
+  sample_data_path: "/app/data/sample_documents.jsonl"
