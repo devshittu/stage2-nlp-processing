@@ -64,6 +64,7 @@ from src.schemas.data_models import (
 )
 from src.core.event_linker import get_event_linker
 from src.storage.backends import MultiBackendWriter
+from src.core.checkpoint_manager import CheckpointManager, CheckpointStatus
 
 
 # =============================================================================
@@ -607,6 +608,65 @@ def save_processed_documents(
         return {"documents_saved": 0, "backend_results": {}}
 
 
+def save_single_document(
+    result: Dict[str, Any],
+    storage_writer: MultiBackendWriter,
+    linkages: Optional[List[EventLinkage]] = None,
+    storylines: Optional[List[Storyline]] = None
+) -> bool:
+    """
+    Save a single processed document to storage immediately (progressive saving).
+
+    Args:
+        result: Processing result for one document
+        storage_writer: Storage backend writer
+        linkages: Optional event linkages (can be empty for progressive saves)
+        storylines: Optional storylines (can be empty for progressive saves)
+
+    Returns:
+        True if saved successfully, False otherwise
+    """
+    try:
+        # Build ProcessedDocument
+        doc = ProcessedDocument(
+            document_id=result["document_id"],
+            job_id=result.get("job_id"),
+            processed_at=result["processed_at"],
+            normalized_date=result["source_document"].get("cleaned_publication_date"),
+            original_text=result["source_document"].get("cleaned_text", ""),
+            source_document=result["source_document"],
+            extracted_entities=[Entity(**e) for e in result["entities"]],
+            extracted_soa_triplets=[SOATriplet(**t) for t in result.get("soa_triplets", [])],
+            events=[Event(**e) for e in result["events"]],
+            event_linkages=linkages or [],
+            storylines=storylines or [],
+            processing_metadata={
+                "processing_time_ms": result["processing_time_ms"],
+                "entities_count": len(result["entities"]),
+                "events_count": len(result["events"]),
+                "soa_triplets_count": len(result.get("soa_triplets", [])),
+                "progressive_save": True  # Flag to indicate this was saved progressively
+            }
+        )
+
+        # Save single document
+        save_results = storage_writer.save_batch([doc])
+
+        logger.debug(
+            f"Progressively saved document: {result['document_id']}",
+            extra={"save_results": save_results}
+        )
+
+        return True
+
+    except Exception as e:
+        logger.error(
+            f"Failed to progressively save document {result.get('document_id', 'unknown')}: {e}",
+            exc_info=True
+        )
+        return False
+
+
 # =============================================================================
 # Celery Tasks
 # =============================================================================
@@ -778,6 +838,9 @@ def process_batch_task(
     cluster = None
     client = None
 
+    # Initialize checkpoint manager for progressive saving and pause/resume
+    checkpoint_mgr = CheckpointManager()
+
     try:
         # Validate documents input
         if not isinstance(documents, list):
@@ -824,6 +887,33 @@ def process_batch_task(
         # Use cached models (loaded once per worker)
         logger.info("Using cached NLP models")
         storage_writer = MultiBackendWriter()
+
+        # Create or load checkpoint for progressive saving and resume capability
+        checkpoint = checkpoint_mgr.load_checkpoint(task_id)
+        if checkpoint:
+            logger.info(
+                f"Resuming batch from checkpoint: {checkpoint.processed_documents}/{checkpoint.total_documents} processed",
+                extra={
+                    "checkpoint_status": checkpoint.status,
+                    "processed": checkpoint.processed_documents,
+                    "failed": checkpoint.failed_documents
+                }
+            )
+            # Filter out already processed documents
+            documents_list = checkpoint_mgr.get_remaining_documents(task_id, documents_list)
+            logger.info(f"Remaining documents to process: {len(documents_list)}")
+        else:
+            # Create new checkpoint
+            checkpoint = checkpoint_mgr.create_checkpoint(
+                job_id=task_id,
+                batch_id=batch_id,
+                total_documents=total_docs,
+                metadata={
+                    "started_at": start_time.isoformat() + "Z",
+                    "progressive_save_enabled": True
+                }
+            )
+            logger.info(f"Created checkpoint for batch: {batch_id}")
 
         # Create Dask cluster if enabled
         if celery_config.dask_enabled:
@@ -917,14 +1007,35 @@ def process_batch_task(
 
                     try:
                         result = future.result()
+                        result["job_id"] = task_id  # Add job_id to result
                         processed_results.append(result)
 
                         if result["success"]:
                             documents_processed += 1
                             logger.info(f"✓ Document {document_id} processed successfully")
+
+                            # PROGRESSIVE SAVE: Save document immediately to storage
+                            save_success = save_single_document(result, storage_writer)
+
+                            if save_success:
+                                # Update checkpoint with successfully processed document
+                                checkpoint_mgr.update_checkpoint(
+                                    job_id=task_id,
+                                    processed_doc_id=document_id
+                                )
+                                logger.debug(f"Progressively saved and checkpointed: {document_id}")
+                            else:
+                                logger.warning(f"Failed to progressively save {document_id}, will retry in batch save")
+
                         else:
                             documents_failed += 1
                             logger.error(f"✗ Document {document_id} processing failed: {result.get('error', 'Unknown error')}")
+
+                            # Update checkpoint with failed document
+                            checkpoint_mgr.update_checkpoint(
+                                job_id=task_id,
+                                failed_doc_id=document_id
+                            )
 
                     except Exception as e:
                         # CRITICAL: Record failed document for traceability
@@ -942,10 +1053,28 @@ def process_batch_task(
                             "processing_time_ms": 0,
                             "processed_at": datetime.utcnow().isoformat() + "Z",
                             "error": error_msg,
-                            "error_traceback": traceback.format_exc()
+                            "error_traceback": traceback.format_exc(),
+                            "job_id": task_id
                         }
                         processed_results.append(failed_result)
                         documents_failed += 1
+
+                        # Update checkpoint with failed document
+                        checkpoint_mgr.update_checkpoint(
+                            job_id=task_id,
+                            failed_doc_id=document_id
+                        )
+
+                    # Check for pause/stop signals
+                    if checkpoint_mgr.is_paused(task_id):
+                        logger.warning(f"Batch processing paused at {len(processed_results)}/{total_docs} documents")
+                        checkpoint_mgr.update_checkpoint(task_id, status=CheckpointStatus.PAUSED)
+                        raise Exception("Batch processing paused by user")
+
+                    if checkpoint_mgr.is_stopped(task_id):
+                        logger.warning(f"Batch processing stopped at {len(processed_results)}/{total_docs} documents")
+                        checkpoint_mgr.update_checkpoint(task_id, status=CheckpointStatus.STOPPED)
+                        raise Exception("Batch processing stopped by user")
 
                     # Update progress
                     progress = (len(processed_results) / total_docs) * 100
@@ -1071,6 +1200,10 @@ def process_batch_task(
             except Exception as e:
                 logger.warning(f"Failed to publish batch.completed event: {e}")
 
+        # Mark checkpoint as completed
+        checkpoint_mgr.complete(task_id)
+        logger.info(f"Batch processing completed, checkpoint finalized")
+
         return result
 
     except Exception as e:
@@ -1081,6 +1214,15 @@ def process_batch_task(
             batch_id=batch_id,
             task_id=task_id
         )
+
+        # Mark checkpoint as failed (unless paused/stopped intentionally)
+        if "paused by user" in str(e).lower():
+            logger.info("Batch paused, checkpoint retained for resume")
+        elif "stopped by user" in str(e).lower():
+            logger.info("Batch stopped, checkpoint retained")
+        else:
+            checkpoint_mgr.update_checkpoint(task_id, status=CheckpointStatus.FAILED)
+            logger.error("Batch failed, checkpoint marked as failed")
 
         return {
             "success": False,

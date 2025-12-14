@@ -9,6 +9,10 @@ Comprehensive scripts for submitting, monitoring, and analyzing batch NLP proces
 | `submit_batch.sh` | Submit a batch processing job | `./scripts/submit_batch.sh <input.jsonl> [batch_id]` |
 | `monitor_batch.sh` | Monitor job progress in real-time | `./scripts/monitor_batch.sh [job_id]` |
 | `analyze_batch.sh` | Generate comprehensive metrics | `./scripts/analyze_batch.sh [job_id]` |
+| `pause_batch.sh` | Pause a running batch | `./scripts/pause_batch.sh [job_id]` |
+| `resume_batch.sh` | Resume a paused batch | `./scripts/resume_batch.sh [job_id]` |
+| `stop_batch.sh` | Stop a batch (cannot resume) | `./scripts/stop_batch.sh [job_id]` |
+| `checkpoint_status.sh` | View checkpoint progress | `./scripts/checkpoint_status.sh [job_id]` |
 
 ---
 

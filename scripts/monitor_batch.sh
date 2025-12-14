@@ -38,7 +38,18 @@ echo ""
 # Poll interval in seconds
 POLL_INTERVAL=30
 
-# Function to count processed documents from logs
+# Function to get checkpoint-based progress (more accurate than logs)
+get_checkpoint_progress() {
+    docker exec nlp-celery-worker python3 -c "
+from src.core.checkpoint_manager import CheckpointManager
+import json
+checkpoint_mgr = CheckpointManager()
+progress = checkpoint_mgr.get_progress('$JOB_ID')
+print(json.dumps(progress) if progress else '{}')
+" 2>/dev/null || echo "{}"
+}
+
+# Function to count processed documents from logs (fallback)
 count_processed() {
     docker logs nlp-celery-worker 2>&1 | grep "✓ Document doc_" | wc -l
 }
@@ -59,8 +70,21 @@ while true; do
     RESPONSE=$(curl -s http://localhost:8000/api/v1/jobs/$JOB_ID 2>/dev/null)
     STATUS=$(echo "$RESPONSE" | jq -r '.status' 2>/dev/null || echo "UNKNOWN")
 
-    # Count processed documents
-    CURRENT_COUNT=$(count_processed)
+    # Get checkpoint progress (more accurate than logs)
+    CHECKPOINT_DATA=$(get_checkpoint_progress)
+    if [ "$CHECKPOINT_DATA" != "{}" ]; then
+        CURRENT_COUNT=$(echo "$CHECKPOINT_DATA" | jq -r '.processed // 0')
+        FAILED_COUNT=$(echo "$CHECKPOINT_DATA" | jq -r '.failed // 0')
+        TOTAL_DOCS=$(echo "$CHECKPOINT_DATA" | jq -r '.total_documents // 0')
+        CHECKPOINT_STATUS=$(echo "$CHECKPOINT_DATA" | jq -r '.status // "UNKNOWN"')
+    else
+        # Fallback to log counting
+        CURRENT_COUNT=$(count_processed)
+        FAILED_COUNT=0
+        TOTAL_DOCS=0
+        CHECKPOINT_STATUS="UNKNOWN"
+    fi
+
     DOCS_THIS_INTERVAL=$((CURRENT_COUNT - LAST_COUNT))
     LAST_COUNT=$CURRENT_COUNT
 
@@ -71,9 +95,14 @@ while true; do
         RATE="0.00"
     fi
 
-    # Display progress
+    # Display progress with checkpoint info
     TIMESTAMP=$(date '+%H:%M:%S')
-    echo -e "${CYAN}[$ITERATION]${NC} $TIMESTAMP | Status: ${YELLOW}$STATUS${NC} | Processed: ${GREEN}$CURRENT_COUNT${NC} | Rate: ${BLUE}$RATE docs/min${NC} (+$DOCS_THIS_INTERVAL)"
+    if [ $TOTAL_DOCS -gt 0 ]; then
+        PROGRESS_PCT=$(echo "scale=1; ($CURRENT_COUNT / $TOTAL_DOCS) * 100" | bc)
+        echo -e "${CYAN}[$ITERATION]${NC} $TIMESTAMP | Status: ${YELLOW}$STATUS${NC} | Progress: ${GREEN}$CURRENT_COUNT/$TOTAL_DOCS${NC} (${PROGRESS_PCT}%) | Failed: ${RED}$FAILED_COUNT${NC} | Rate: ${BLUE}$RATE docs/min${NC}"
+    else
+        echo -e "${CYAN}[$ITERATION]${NC} $TIMESTAMP | Status: ${YELLOW}$STATUS${NC} | Processed: ${GREEN}$CURRENT_COUNT${NC} | Failed: ${RED}$FAILED_COUNT${NC} | Rate: ${BLUE}$RATE docs/min${NC} (+$DOCS_THIS_INTERVAL)"
+    fi
 
     # Check if job completed
     if [ "$STATUS" = "SUCCESS" ]; then
