@@ -1,0 +1,118 @@
+# Stage 2 NLP Processing Service - Python Dependencies
+# Optimized for Python 3.10+ with GPU support
+
+# =============================================================================
+# CORE FRAMEWORK
+# =============================================================================
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.10.0
+pydantic-settings==2.6.1
+
+# =============================================================================
+# NLP MODELS & LIBRARIES
+# =============================================================================
+
+# HuggingFace Transformers & Models
+transformers==4.46.0
+tokenizers==0.20.3
+accelerate==1.1.1
+safetensors==0.4.5
+
+# spaCy for Dependency Parsing
+spacy==3.8.2
+en-core-web-trf @ https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.8.0/en_core_web_trf-3.8.0-py3-none-any.whl
+
+# Sentence Transformers for Event Linking
+sentence-transformers==3.3.0
+
+# vLLM for Optimized LLM Inference (15-25x speedup)
+vllm==0.6.3.post1
+ray==2.39.0
+
+# PyTorch (CUDA 12.1 - adjust for your CUDA version)
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+
+# =============================================================================
+# TASK QUEUE & PARALLEL PROCESSING
+# =============================================================================
+celery==5.4.0
+redis==5.2.0
+
+# Dask for Parallel Batch Processing
+dask[complete]==2024.11.2
+distributed==2024.11.2
+bokeh==3.6.2  # For Dask dashboard
+
+# =============================================================================
+# STORAGE BACKENDS
+# =============================================================================
+# PostgreSQL
+psycopg2-binary==2.9.10
+
+# Elasticsearch
+elasticsearch==8.16.0
+
+# =============================================================================
+# UTILITIES
+# =============================================================================
+# YAML Configuration
+PyYAML==6.0.2
+
+# HTTP Client
+httpx==0.28.0
+aiohttp==3.11.7
+
+# Logging & Monitoring
+python-json-logger==3.2.0
+prometheus-client==0.21.0
+prometheus-fastapi-instrumentator==7.0.0
+
+# ML & Data Science
+numpy==2.1.3
+scikit-learn==1.5.2
+scipy==1.14.1
+
+# CLI
+click==8.1.7
+rich==13.9.4
+
+# Date/Time
+python-dateutil==2.9.0.post0
+
+# =============================================================================
+# DEVELOPMENT & TESTING (Optional)
+# =============================================================================
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+black==24.10.0
+flake8==7.1.1
+mypy==1.13.0
+
+# =============================================================================
+# ADDITIONAL DEPENDENCIES
+# =============================================================================
+# Quantization libraries (for AWQ/GPTQ)
+autoawq==0.2.7.post3
+auto-gptq==0.7.1
+
+# GPU Memory Management
+gputil==1.4.0
+
+# Regex & Text Processing
+regex==2024.11.6
+
+# JSON Utilities
+ujson==5.10.0
+
+# Progress Bars
+tqdm==4.67.0
+
+# CORS
+python-multipart==0.0.12
+
+# Environment Variables
+python-dotenv==1.0.1
