@@ -1,0 +1,4746 @@
+===== FILE: ./src//api/app.py =====
+"""
+api/app.py
+
+Defines the FastAPI application for the Ingestion Microservice,
+exposing RESTful endpoints for preprocessing.
+
+FIXES APPLIED:
+- Fix #5: Batch size validation and rate limiting
+- Fix #7: Prometheus metrics integration
+- Fix #10: Request ID tracing middleware
+- Fix #11: API versioning with /v1 prefix
+"""
+
+import logging
+import time
+import uuid
+import json
+from fastapi import FastAPI, HTTPException, status, BackgroundTasks, Request, UploadFile, File, Form, Header, APIRouter
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import ValidationError
+from typing import List, Dict, Any, Optional
+
+# Prometheus instrumentation (Fix #7)
+from prometheus_fastapi_instrumentator import Instrumentator
+
+from src.schemas.data_models import (
+    ArticleInput,
+    PreprocessSingleRequest,
+    PreprocessSingleResponse,
+    PreprocessBatchRequest,
+    PreprocessBatchResponse
+)
+from src.core.processor import TextPreprocessor
+from src.utils.config_manager import ConfigManager
+from src.utils.logger import setup_logging
+from src.storage.backends import StorageBackendFactory
+
+# Import Celery app and task
+from src.celery_app import celery_app, preprocess_article_task
+
+# Load settings and configure logging
+settings = ConfigManager.get_settings()
+setup_logging()
+logger = logging.getLogger("ingestion_service")
+
+# Constants for rate limiting
+MAX_BATCH_SIZE = 1000  # Maximum articles per batch request
+MAX_FILE_SIZE_MB = 50  # Maximum file upload size
+
+# Initialize FastAPI app with versioning
+app = FastAPI(
+    title="Data Ingestion & Preprocessing Service",
+    description="A microservice for ingesting, cleaning, and enriching unstructured text. "
+                "Optimized for news article processing pipelines.",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize Prometheus metrics instrumentation (Fix #7)
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+logger.info("Prometheus metrics enabled at /metrics endpoint")
+
+# Global TextPreprocessor instance per Uvicorn worker process
+preprocessor = TextPreprocessor()
+
+
+# MIDDLEWARE: Request ID tracing (Fix #10)
+@app.middleware("http")
+async def add_request_id_middleware(request: Request, call_next):
+    """
+    Adds X-Request-ID header to all requests for distributed tracing.
+    If client provides X-Request-ID, it's preserved; otherwise, a new UUID is generated.
+    
+    IMPROVEMENT: Enables end-to-end request tracking across microservices.
+    """
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    request.state.request_id = request_id
+
+    # Log the incoming request
+    logger.info(
+        f"Incoming request: {request.method} {request.url.path}",
+        extra={"request_id": request_id, "client_ip": request.client.host}
+    )
+
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+
+    # Log the response
+    logger.info(
+        f"Outgoing response: {response.status_code}",
+        extra={"request_id": request_id, "status_code": response.status_code}
+    )
+
+    return response
+
+
+# MIDDLEWARE: Request timing
+@app.middleware("http")
+async def add_timing_middleware(request: Request, call_next):
+    """
+    Adds X-Process-Time header showing request processing duration.
+    """
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = (time.time() - start_time) * 1000  # Convert to milliseconds
+    response.headers["X-Process-Time"] = f"{process_time:.2f}ms"
+    return response
+
+
+# Root endpoint
+@app.get("/", tags=["General"])
+async def root():
+    """
+    Root endpoint providing service information.
+    """
+    return {
+        "service": "Data Ingestion & Preprocessing Service",
+        "version": "1.0.0",
+        "status": "operational",
+        "docs": "/docs",
+        "health": "/health",
+        "metrics": "/metrics",
+        "api_version": "v1",
+        "endpoints": {
+            "health": "GET /health",
+            "metrics": "GET /metrics",
+            "preprocess_single": "POST /v1/preprocess",
+            "preprocess_batch": "POST /v1/preprocess/batch",
+            "preprocess_file": "POST /v1/preprocess/batch-file",
+            "task_status": "GET /v1/preprocess/status/{task_id}"
+        }
+    }
+
+
+@app.get("/health", status_code=status.HTTP_200_OK, tags=["General"])
+async def health_check():
+    """
+    Health check endpoint.
+    Returns 200 OK if the service is running and the spaCy model is loaded.
+    """
+    if preprocessor.nlp is not None:
+        try:
+            with celery_app.connection_or_acquire() as connection:
+                connection.info()
+            broker_connected = True
+        except Exception as e:
+            logger.error(f"Celery broker connection failed: {e}")
+            broker_connected = False
+
+        return {
+            "status": "ok",
+            "model_loaded": True,
+            "spacy_model": settings.ingestion_service.model_name,
+            "celery_broker_connected": broker_connected,
+            "gpu_enabled": settings.general.gpu_enabled
+        }
+
+    logger.error("Health check failed: SpaCy model not loaded.")
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="SpaCy model is not loaded. Service is not ready."
+    )
+
+
+# API v1 Router (Fix #11: Versioning)
+v1_router = APIRouter(prefix="/v1", tags=["v1"])
+
+
+@v1_router.post("/preprocess", response_model=PreprocessSingleResponse, status_code=status.HTTP_200_OK)
+async def preprocess_single_article(
+    request: PreprocessSingleRequest,
+    http_request: Request,
+    x_request_id: Optional[str] = Header(None)
+):
+    """
+    Accepts a single structured article and returns the processed, standardized output.
+    This endpoint processes synchronously for immediate feedback.
+    
+    IMPROVEMENTS:
+    - Request ID tracing via X-Request-ID header
+    - Detailed logging with request context
+    """
+    article = request.article
+    start_time = time.time()
+    request_id = http_request.state.request_id
+
+    document_id = article.document_id
+    logger.info(
+        f"Received request for document_id={document_id}.",
+        extra={
+            "document_id": document_id,
+            "endpoint": "/v1/preprocess",
+            "request_id": request_id
+        }
+    )
+
+    try:
+
+        # Extract custom cleaning config if provided
+        custom_config = None
+        if request.cleaning_config:
+            custom_config = request.cleaning_config.model_dump(exclude_none=True)
+
+        processed_data = preprocessor.preprocess(
+            document_id=article.document_id,
+            text=article.text,
+            title=article.title,
+            excerpt=article.excerpt,
+            author=article.author,
+            publication_date=article.publication_date,
+            revision_date=article.revision_date,
+            source_url=article.source_url,
+            categories=article.categories,
+            tags=article.tags,
+            media_asset_urls=article.media_asset_urls,
+            geographical_data=article.geographical_data,
+            embargo_date=article.embargo_date,
+            sentiment=article.sentiment,
+            word_count=article.word_count,
+            publisher=article.publisher,
+            additional_metadata=article.additional_metadata,
+            custom_cleaning_config=custom_config  # ADD THIS LINE
+        )
+
+        response = PreprocessSingleResponse(
+            document_id=document_id,
+            version="1.0",
+            original_text=processed_data.get("original_text", ""),
+            cleaned_text=processed_data.get("cleaned_text", ""),
+            cleaned_title=processed_data.get("cleaned_title"),
+            cleaned_excerpt=processed_data.get("cleaned_excerpt"),
+            cleaned_author=processed_data.get("cleaned_author"),
+            cleaned_publication_date=processed_data.get(
+                "cleaned_publication_date"),
+            cleaned_revision_date=processed_data.get("cleaned_revision_date"),
+            cleaned_source_url=processed_data.get("cleaned_source_url"),
+            cleaned_categories=processed_data.get("cleaned_categories"),
+            cleaned_tags=processed_data.get("cleaned_tags"),
+            cleaned_media_asset_urls=processed_data.get(
+                "cleaned_media_asset_urls"),
+            cleaned_geographical_data=processed_data.get(
+                "cleaned_geographical_data"),
+            cleaned_embargo_date=processed_data.get("cleaned_embargo_date"),
+            cleaned_sentiment=processed_data.get("cleaned_sentiment"),
+            cleaned_word_count=processed_data.get("cleaned_word_count"),
+            cleaned_publisher=processed_data.get("cleaned_publisher"),
+            temporal_metadata=processed_data.get("temporal_metadata"),
+            entities=processed_data.get("entities", []),
+            cleaned_additional_metadata=processed_data.get(
+                "cleaned_additional_metadata")
+        )
+
+        # Persist to requested storage backends if specified
+        persist_to_backends = request.persist_to_backends
+        if persist_to_backends:
+            backends = StorageBackendFactory.get_backends(persist_to_backends)
+            for backend in backends:
+                backend.save(response)
+
+        duration = (time.time() - start_time) * 1000
+        logger.info(
+            f"Successfully processed document_id={document_id} in {duration:.2f}ms.",
+            extra={
+                "document_id": document_id,
+                "duration_ms": duration,
+                "request_id": request_id
+            }
+        )
+
+        return response
+
+    except ValidationError as e:
+        logger.warning(
+            f"Invalid request payload for /v1/preprocess: {e.errors()}",
+            extra={"document_id": document_id, "request_id": request_id}
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid input: {e.errors()}"
+        )
+    except Exception as e:
+        logger.error(
+            f"Internal server error during single article preprocessing: {e}",
+            exc_info=True,
+            extra={"document_id": document_id, "request_id": request_id}
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error during preprocessing."
+        )
+
+
+@v1_router.post("/preprocess/batch", status_code=status.HTTP_202_ACCEPTED)
+async def submit_batch(request: PreprocessBatchRequest, http_request: Request):
+    """
+    Accepts a list of structured articles and submits them as a batch job to Celery.
+    Returns a list of task IDs for tracking. This endpoint is non-blocking.
+    
+    IMPROVEMENTS:
+    - Fix #5: Batch size validation (max 1000 articles)
+    - Request ID tracing
+    """
+    articles = request.articles
+    request_id = http_request.state.request_id
+
+    logger.info(
+        f"Received request to submit a batch job for {len(articles)} articles to Celery.",
+        extra={"request_id": request_id, "batch_size": len(articles)}
+    )
+
+    # Fix #5: Validate batch size
+    if not articles:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Batch request must contain at least one article."
+        )
+
+    if len(articles) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Batch size ({len(articles)}) exceeds maximum allowed ({MAX_BATCH_SIZE}). "
+            f"Please split your batch into smaller chunks."
+        )
+
+    task_ids = []
+    for i, article_input in enumerate(articles):
+        task = preprocess_article_task.delay(
+            article_input.model_dump_json(), None)
+        task_ids.append(task.id)
+        logger.debug(
+            f"Submitted article {i+1} as Celery task: {task.id}",
+            extra={
+                "document_id": article_input.document_id,
+                "task_id": task.id,
+                "request_id": request_id
+            }
+        )
+
+    return {
+        "message": "Batch processing job submitted to Celery.",
+        "task_ids": task_ids,
+        "batch_size": len(articles),
+        "request_id": request_id
+    }
+
+
+@v1_router.post("/preprocess/batch-file", status_code=status.HTTP_202_ACCEPTED)
+async def submit_batch_file(
+    http_request: Request,
+    file: UploadFile = File(...),
+    persist_to_backends: str = Form(None)
+):
+    """
+    Accepts a JSONL file upload containing structured articles (one per line) and submits them as a batch job to Celery.
+    Returns a list of task IDs for tracking. This endpoint is non-blocking.
+    Handles validation and skips invalid lines with logging.
+    Optionally specifies storage backends (e.g., 'jsonl,elasticsearch') for persisting processed results.
+    
+    IMPROVEMENTS:
+    - Fix #5: File size validation (max 50MB)
+    - Request ID tracing
+    """
+    request_id = http_request.state.request_id
+
+    # Validate file size
+    file.file.seek(0, 2)  # Seek to end
+    file_size_mb = file.file.tell() / (1024 * 1024)
+    file.file.seek(0)  # Reset to beginning
+
+    if file_size_mb > MAX_FILE_SIZE_MB:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size ({file_size_mb:.2f}MB) exceeds maximum allowed ({MAX_FILE_SIZE_MB}MB)"
+        )
+
+    try:
+        contents = await file.read()
+        lines = contents.decode('utf-8').splitlines()
+    except Exception as e:
+        logger.error(
+            f"Failed to read uploaded file: {e}",
+            extra={"request_id": request_id}
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid file upload or encoding error."
+        )
+
+    if not lines:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file must contain at least one article."
+        )
+
+    # Fix #5: Validate total articles in file
+    if len(lines) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File contains {len(lines)} articles, exceeding maximum allowed ({MAX_BATCH_SIZE}). "
+            f"Please split your file into smaller chunks."
+        )
+
+    task_ids = []
+    skipped_lines = 0
+
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue  # Skip empty lines
+        try:
+            article_data = json.loads(line)
+            article_input = ArticleInput.model_validate(article_data)
+            task = preprocess_article_task.delay(
+                json.dumps(article_data), persist_to_backends)
+            task_ids.append(task.id)
+            logger.debug(
+                f"Submitted article {i+1} from file as Celery task: {task.id}",
+                extra={
+                    "document_id": article_input.document_id,
+                    "task_id": task.id,
+                    "request_id": request_id
+                }
+            )
+        except json.JSONDecodeError as e:
+            skipped_lines += 1
+            logger.warning(
+                f"Skipping malformed JSON line in uploaded file (line {i+1}): {e}",
+                extra={"request_id": request_id}
+            )
+        except ValidationError as e:
+            skipped_lines += 1
+            logger.warning(
+                f"Invalid article data in uploaded file line {i+1}: {e.errors()}",
+                extra={"request_id": request_id}
+            )
+
+    if not task_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid articles found in the uploaded file."
+        )
+
+    return {
+        "message": "Batch file processing job submitted to Celery.",
+        "task_ids": task_ids,
+        "total_articles": len(task_ids),
+        "skipped_lines": skipped_lines,
+        "request_id": request_id
+    }
+
+
+@v1_router.get("/preprocess/status/{task_id}")
+async def get_batch_job_status(task_id: str, http_request: Request):
+    """
+    Retrieves the status and result of a Celery task by its ID.
+    
+    IMPROVEMENT: Request ID tracing
+    """
+    request_id = http_request.state.request_id
+    task = celery_app.AsyncResult(task_id)
+
+    if task.state == 'PENDING':
+        response = {
+            "task_id": task.id,
+            "status": task.state,
+            "message": "Task is pending or unknown (might not have started yet or task ID is invalid).",
+            "request_id": request_id
+        }
+    elif task.state == 'STARTED':
+        response = {
+            "task_id": task.id,
+            "status": task.state,
+            "message": "Task has started processing.",
+            "request_id": request_id
+        }
+    elif task.state == 'PROGRESS':
+        response = {
+            "task_id": task.id,
+            "status": task.state,
+            "message": "Task is in progress.",
+            "info": task.info,
+            "request_id": request_id
+        }
+    elif task.state == 'SUCCESS':
+        response = {
+            "task_id": task.id,
+            "status": task.state,
+            "result": task.result,
+            "message": "Task completed successfully.",
+            "request_id": request_id
+        }
+    elif task.state == 'FAILURE':
+        response = {
+            "task_id": task.id,
+            "status": task.state,
+            "error": str(task.info),
+            "message": "Task failed.",
+            "request_id": request_id
+        }
+    else:
+        response = {
+            "task_id": task.id,
+            "status": task.state,
+            "message": "Unknown task state.",
+            "request_id": request_id
+        }
+
+    return response
+
+
+# Include v1 router in the main app
+app.include_router(v1_router)
+
+# api/app.py
+
+===== END: ./src//api/app.py =====
+
+===== FILE: ./src//schemas/data_models.py =====
+# src/schemas/data_models.py
+"""
+src/schemas/data_models.py
+
+Defines Pydantic models for API request and response payloads.
+
+UPDATED: Added support for custom cleaning configuration via API/CLI.
+"""
+
+from typing import List, Optional, Any, Dict
+from pydantic import BaseModel, Field, HttpUrl
+from datetime import date
+
+# --- Common Models ---
+
+
+class TextSpan(BaseModel):
+    """Represents a span of text within a larger string."""
+    text: str = Field(..., description="The detected text span.")
+    start_char: int = Field(..., description="Starting character index.")
+    end_char: int = Field(...,
+                          description="Ending character index (exclusive).")
+
+
+class Entity(BaseModel):
+    """Represents a named entity recognized in text."""
+    text: str = Field(..., description="The detected entity text.")
+    type: str = Field(...,
+                      description="Entity type (e.g., PERSON, ORG, GPE, LOC, DATE).")
+    start_char: int = Field(..., description="Starting character index.")
+    end_char: int = Field(...,
+                          description="Ending character index (exclusive).")
+
+
+class CleaningConfigOverride(BaseModel):
+    """
+    Optional cleaning configuration override for per-request customization.
+    Any field not specified will use the default from settings.yaml.
+    """
+    remove_html_tags: Optional[bool] = Field(
+        None, description="Remove HTML tags.")
+    normalize_whitespace: Optional[bool] = Field(
+        None, description="Normalize whitespace.")
+    fix_encoding: Optional[bool] = Field(
+        None, description="Fix encoding issues.")
+    normalize_punctuation: Optional[bool] = Field(
+        None, description="Normalize punctuation.")
+    standardize_units: Optional[bool] = Field(
+        None, description="Standardize units.")
+    standardize_currency: Optional[bool] = Field(
+        None, description="Standardize currency.")
+    enable_typo_correction: Optional[bool] = Field(
+        None, description="Enable typo correction.")
+
+    # Typo correction sub-settings
+    typo_min_length: Optional[int] = Field(
+        None, description="Min word length for typo check.")
+    typo_max_length: Optional[int] = Field(
+        None, description="Max word length for typo check.")
+    typo_use_ner: Optional[bool] = Field(
+        None, description="Use NER to protect proper nouns.")
+    typo_confidence: Optional[float] = Field(
+        None, description="Typo correction confidence (0.0-1.0).")
+
+
+class ArticleInput(BaseModel):
+    """
+    Input model for an article with optional cleaning configuration override.
+    """
+    document_id: str = Field(...,
+                             description="Unique identifier for the document.")
+    text: str = Field(..., description="Raw, unstructured text content.")
+    title: Optional[str] = Field(None, description="Article title.")
+    excerpt: Optional[str] = Field(
+        None, description="Brief summary or excerpt.")
+    author: Optional[str] = Field(None, description="Author's name.")
+    publication_date: Optional[date] = Field(
+        None, description="Publication date.")
+    revision_date: Optional[date] = Field(
+        None, description="Last revision date.")
+    source_url: Optional[HttpUrl] = Field(None, description="Source URL.")
+    categories: Optional[List[str]] = Field(None, description="Categories.")
+    tags: Optional[List[str]] = Field(None, description="Tags.")
+    media_asset_urls: Optional[List[HttpUrl]] = Field(
+        None, description="Media URLs.")
+    geographical_data: Optional[Dict[str, Any]] = Field(
+        None, description="Geographical metadata.")
+    embargo_date: Optional[date] = Field(None, description="Embargo date.")
+    sentiment: Optional[str] = Field(None, description="Sentiment.")
+    word_count: Optional[int] = Field(None, description="Word count.")
+    publisher: Optional[str] = Field(None, description="Publisher.")
+    additional_metadata: Optional[Dict[str, Any]] = Field(
+        None, description="Additional metadata.")
+
+
+class PreprocessSingleRequest(BaseModel):
+    """Request model for processing a single article."""
+    article: ArticleInput = Field(..., description="Article to process.")
+    persist_to_backends: Optional[List[str]] = Field(
+        None, description="Storage backends to persist to (e.g., ['jsonl', 'postgresql']).")
+    cleaning_config: Optional[CleaningConfigOverride] = Field(
+        None, description="Optional cleaning configuration override for this request.")
+
+
+class PreprocessSingleResponse(BaseModel):
+    """Response model for a single preprocessed article."""
+    document_id: str = Field(..., description="Document unique identifier.")
+    version: str = Field("1.0", description="Schema version.")
+    original_text: str = Field(..., description="Original input text.")
+    cleaned_text: str = Field(..., description="Cleaned and normalized text.")
+
+    # Cleaned metadata fields
+    cleaned_title: Optional[str] = Field(None, description="Cleaned title.")
+    cleaned_excerpt: Optional[str] = Field(
+        None, description="Cleaned excerpt.")
+    cleaned_author: Optional[str] = Field(None, description="Cleaned author.")
+    cleaned_publication_date: Optional[date] = Field(
+        None, description="Cleaned publication date.")
+    cleaned_revision_date: Optional[date] = Field(
+        None, description="Cleaned revision date.")
+    cleaned_source_url: Optional[HttpUrl] = Field(
+        None, description="Cleaned source URL.")
+    cleaned_categories: Optional[List[str]] = Field(
+        None, description="Cleaned categories.")
+    cleaned_tags: Optional[List[str]] = Field(
+        None, description="Cleaned tags.")
+    cleaned_media_asset_urls: Optional[List[HttpUrl]] = Field(
+        None, description="Cleaned media URLs.")
+    cleaned_geographical_data: Optional[Dict[str, Any]] = Field(
+        None, description="Cleaned geographical data.")
+    cleaned_embargo_date: Optional[date] = Field(
+        None, description="Cleaned embargo date.")
+    cleaned_sentiment: Optional[str] = Field(
+        None, description="Cleaned sentiment.")
+    cleaned_word_count: Optional[int] = Field(
+        None, description="Cleaned/computed word count.")
+    cleaned_publisher: Optional[str] = Field(
+        None, description="Cleaned publisher.")
+
+    temporal_metadata: Optional[str] = Field(
+        None, description="Normalized date (YYYY-MM-DD).")
+    entities: List[Entity] = Field(
+        default_factory=list, description="Tagged entities.")
+    cleaned_additional_metadata: Optional[Dict[str, Any]] = Field(
+        None, description="Cleaned additional metadata.")
+
+
+class PreprocessBatchRequest(BaseModel):
+    """Request model for batch processing."""
+    articles: List[ArticleInput] = Field(...,
+                                         description="List of articles to process.")
+    persist_to_backends: Optional[List[str]] = Field(
+        None, description="Storage backends.")
+    cleaning_config: Optional[CleaningConfigOverride] = Field(
+        None, description="Optional cleaning configuration override for entire batch.")
+
+
+class PreprocessBatchResponse(BaseModel):
+    """Response model for batch processing."""
+    processed_articles: List[PreprocessSingleResponse] = Field(
+        ..., description="Processed articles.")
+
+
+class PreprocessFileResult(BaseModel):
+    """Model for CLI batch processing output."""
+    document_id: str = Field(..., description="Document unique identifier.")
+    version: str = Field("1.0", description="Schema version.")
+    processed_data: PreprocessSingleResponse
+
+# src/schemas/data_models.py
+
+===== END: ./src//schemas/data_models.py =====
+
+===== FILE: ./src//core/processor.py =====
+"""
+src/core/processor.py
+
+Contains the core business logic for text cleaning, temporal metadata
+extraction, and basic entity tagging.
+
+REFACTORED:
+- Separated cleaning logic to src/utils/text_cleaners.py
+- Fully configurable pipeline via settings.yaml
+- NER-aware typo correction (fixes "San Francisco" issue)
+- Proper separation of concerns
+"""
+
+from src.utils.config_manager import ConfigManager
+from src.utils.text_cleaners import TextCleanerConfig, clean_text_pipeline
+from src.schemas.data_models import PreprocessSingleResponse, Entity
+from pathlib import Path
+from datetime import date, datetime, timedelta
+from typing import Dict, Any, List, Optional, Union, Set
+import json
+import atexit
+import logging
+import re
+import spacy
+import os
+from pydantic import HttpUrl
+from pydantic_core import Url
+from spellchecker import SpellChecker
+
+# Language detection imports with proper error handling
+try:
+    from langdetect import detect, DetectorFactory
+    # Warm up langdetect on module load
+    try:
+        _ = detect("Initialize language detection profiles.")
+    except:
+        pass
+    DetectorFactory.seed = 0
+except ImportError:
+    detect = None
+
+logger = logging.getLogger("ingestion_service")
+
+
+class TextPreprocessor:
+    """
+    A class for ingesting, cleaning, and preprocessing unstructured text.
+    Uses spaCy for NER and modular text cleaners from utils.
+    
+    IMPROVEMENTS:
+    - Modular, configurable cleaning pipeline
+    - NER-aware typo correction
+    - Proper separation of concerns
+    - All cleaning steps configurable via settings.yaml or API
+    """
+    
+    # Class-level cache for spaCy models
+    _nlp_cache: Dict[str, Any] = {}
+
+    def __init__(self, custom_config: Optional[Dict[str, Any]] = None):
+        """
+        Initialize the TextPreprocessor.
+        
+        Args:
+            custom_config: Optional custom cleaning configuration to override settings
+        """
+        self.nlp = None
+        self.settings = ConfigManager.get_settings()
+        self.spell_checker = None  # Lazy initialization
+        
+        # Initialize cleaning configuration
+        if custom_config:
+            self.cleaning_config = TextCleanerConfig(custom_config)
+        else:
+            pipeline_config = self.settings.ingestion_service.cleaning_pipeline.model_dump()
+            self.cleaning_config = TextCleanerConfig(pipeline_config)
+        
+        self._load_models()
+
+    def _load_models(self):
+        """Load spaCy model with class-level caching."""
+        try:
+            model_name = self.settings.ingestion_service.model_name
+            cache_dir = self.settings.ingestion_service.model_cache_dir
+            
+            # Reuse cached model
+            if model_name in TextPreprocessor._nlp_cache:
+                self.nlp = TextPreprocessor._nlp_cache[model_name]
+                logger.info(f"Reusing cached spaCy model '{model_name}'")
+                return
+            
+            logger.info(f"Loading spaCy model '{model_name}' with cache directory: {cache_dir}...")
+            os.environ["SPACY_DATA"] = cache_dir
+
+            if self.settings.general.gpu_enabled:
+                try:
+                    spacy.require_gpu()
+                    logger.info("SpaCy using GPU.")
+                except Exception as e:
+                    logger.warning(f"SpaCy GPU unavailable: {e}. Using CPU.")
+            else:
+                logger.info("GPU disabled. SpaCy using CPU.")
+
+            nlp = spacy.load(model_name)
+            TextPreprocessor._nlp_cache[model_name] = nlp
+            self.nlp = nlp
+            
+            logger.info(f"SpaCy model '{model_name}' loaded and cached.")
+
+        except Exception as e:
+            logger.critical(f"Failed to load spaCy model: {e}", exc_info=True)
+            raise RuntimeError(f"Failed to load spaCy model. Error: {e}")
+
+    def _get_spell_checker(self) -> SpellChecker:
+        """Lazy initialization of spell checker."""
+        if self.spell_checker is None:
+            self.spell_checker = SpellChecker()
+            logger.debug("Spell checker initialized")
+        return self.spell_checker
+
+    def close(self):
+        """Free up resources."""
+        if self.nlp:
+            logger.info("Closing TextPreprocessor instance")
+            self.nlp = None
+        if self.spell_checker:
+            self.spell_checker = None
+
+    def tag_entities(self, text: str) -> List[Entity]:
+        """
+        Perform Named Entity Recognition using spaCy.
+        
+        Args:
+            text: Cleaned text to tag
+            
+        Returns:
+            List of Entity objects
+        """
+        logger.debug("Starting entity tagging")
+        if self.nlp is None:
+            logger.error("spaCy model not loaded")
+            return []
+
+        try:
+            doc = self.nlp(text)
+            entities = []
+            
+            # Filter by configured entity types
+            entity_types = self.settings.ingestion_service.entity_recognition.entity_types_to_extract
+            
+            for ent in doc.ents:
+                if ent.label_ in entity_types:
+                    entities.append(Entity(
+                        text=ent.text,
+                        type=ent.label_,
+                        start_char=ent.start_char,
+                        end_char=ent.end_char
+                    ))
+            
+            logger.debug(f"Found {len(entities)} entities")
+            return entities
+        except Exception as e:
+            logger.error(f"Error during entity tagging: {e}", exc_info=True)
+            return []
+
+    def clean_text(
+        self,
+        text: str,
+        ner_entities: Optional[Set[str]] = None,
+        custom_config: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Clean text using modular cleaning pipeline.
+        
+        CRITICAL: Can pass NER entities to protect proper nouns from typo correction.
+        
+        Args:
+            text: Raw input text
+            ner_entities: Optional set of entity texts to protect (e.g., {"San Francisco", "Apple Inc."})
+            custom_config: Optional custom configuration to override instance config
+            
+        Returns:
+            Cleaned text
+        """
+        config = self.cleaning_config
+        if custom_config:
+            config = TextCleanerConfig(custom_config)
+        
+        spell_checker = self._get_spell_checker() if config.enable_typo_correction else None
+        
+        return clean_text_pipeline(
+            text=text,
+            config=config,
+            ner_entities=ner_entities,
+            spell_checker=spell_checker
+        )
+
+    def clean_text_with_ner_protection(self, text: str) -> tuple[str, List[Entity]]:
+        """
+        Clean text while protecting NER entities from typo correction.
+        
+        This method first extracts entities, then uses them to protect proper nouns
+        during cleaning. This solves the "San Francisco" -> "Can Francisco" issue.
+        
+        Args:
+            text: Raw input text
+            
+        Returns:
+            Tuple of (cleaned_text, entities)
+        """
+        # Step 1: Do a quick NER pass on original text to identify entities
+        if self.cleaning_config.typo_use_ner and self.nlp:
+            logger.debug("Extracting entities for typo protection")
+            doc = self.nlp(text)
+            entity_texts = {ent.text for ent in doc.ents}
+        else:
+            entity_texts = None
+        
+        # Step 2: Clean text with entity protection
+        cleaned_text = self.clean_text(text, ner_entities=entity_texts)
+        
+        # Step 3: Extract entities from cleaned text
+        entities = self.tag_entities(cleaned_text)
+        
+        return cleaned_text, entities
+
+    def _clean_field(self, field_value: Any) -> Any:
+        """
+        Recursively clean metadata fields.
+        
+        Args:
+            field_value: Field value to clean
+            
+        Returns:
+            Cleaned value
+        """
+        if field_value is None:
+            return None
+
+        if isinstance(field_value, str):
+            return self.clean_text(field_value) or None
+        elif isinstance(field_value, list):
+            cleaned_list = []
+            for item in field_value:
+                if isinstance(item, str):
+                    cleaned = self.clean_text(item)
+                    if cleaned:
+                        cleaned_list.append(cleaned)
+                elif isinstance(item, Url):
+                    cleaned_list.append(item)
+            return cleaned_list or None
+        elif isinstance(field_value, dict):
+            cleaned_dict = {}
+            for key, value in field_value.items():
+                if isinstance(value, str):
+                    cleaned = self.clean_text(value)
+                    if cleaned:
+                        cleaned_dict[key] = cleaned
+                else:
+                    cleaned_dict[key] = value
+            return cleaned_dict or None
+        elif isinstance(field_value, (Url, bool, int, date, datetime)):
+            return field_value
+        else:
+            logger.warning(f"Unsupported field type: {type(field_value)}")
+            return field_value
+
+    def _get_last_weekday(self, weekday_name: str, reference_date: datetime) -> Optional[date]:
+        """Calculate the most recent occurrence of a weekday."""
+        weekdays = {
+            "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+            "friday": 4, "saturday": 5, "sunday": 6
+        }
+        weekday_name_lower = weekday_name.lower()
+
+        if weekday_name_lower not in weekdays:
+            return None
+
+        target_weekday = weekdays[weekday_name_lower]
+        days_ago = (reference_date.weekday() - target_weekday + 7) % 7
+        if days_ago == 0:
+            days_ago = 7
+
+        last_weekday_date = reference_date - timedelta(days=days_ago)
+        return last_weekday_date.date()
+
+    def extract_temporal_metadata(self, text_to_parse: str, reference_date: Optional[date] = None) -> Optional[str]:
+        """Extract and normalize temporal metadata from text."""
+        import dateparser
+        
+        languages = self.settings.ingestion_service.dateparser_languages
+
+        parsed_reference_date = None
+        if reference_date:
+            if isinstance(reference_date, date) and not isinstance(reference_date, datetime):
+                parsed_reference_date = datetime(
+                    reference_date.year, reference_date.month, reference_date.day)
+            elif isinstance(reference_date, datetime):
+                parsed_reference_date = reference_date
+
+        match = re.match(r'last\s+([a-zA-Z]+)', text_to_parse, re.IGNORECASE)
+        if match and parsed_reference_date:
+            weekday_name = match.group(1)
+            calculated_date = self._get_last_weekday(weekday_name, parsed_reference_date)
+            if calculated_date:
+                return calculated_date.strftime('%Y-%m-%d')
+
+        try:
+            date_obj = dateparser.parse(
+                text_to_parse,
+                languages=languages,
+                settings={
+                    'RELATIVE_BASE': parsed_reference_date,
+                    'PREFER_DATES_FROM': 'past',
+                    'STRICT_PARSING': True
+                }
+            )
+            if date_obj:
+                return date_obj.strftime('%Y-%m-%d')
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to parse date: {e}")
+            return None
+
+    def _detect_language(self, text: str) -> Optional[str]:
+        """Detect language using langdetect."""
+        if not text or len(text.strip()) < 10:
+            return None
+        
+        if detect is None:
+            return None
+        
+        try:
+            return detect(text)
+        except Exception:
+            return None
+
+    def preprocess(
+        self,
+        text: str,
+        document_id: str,
+        title: Optional[str] = None,
+        excerpt: Optional[str] = None,
+        author: Optional[str] = None,
+        publication_date: Optional[date] = None,
+        revision_date: Optional[date] = None,
+        source_url: Optional[HttpUrl] = None,
+        categories: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        media_asset_urls: Optional[List[HttpUrl]] = None,
+        geographical_data: Optional[Dict[str, Any]] = None,
+        embargo_date: Optional[date] = None,
+        sentiment: Optional[str] = None,
+        word_count: Optional[int] = None,
+        publisher: Optional[str] = None,
+        additional_metadata: Optional[Dict[str, Any]] = None,
+        custom_cleaning_config: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Perform complete preprocessing pipeline.
+        
+        Args:
+            text: Main content text
+            document_id: Unique document identifier
+            ... (other metadata fields)
+            custom_cleaning_config: Optional custom cleaning configuration
+            
+        Returns:
+            Dictionary with processed data
+        """
+        logger.info(f"Starting preprocessing for document_id={document_id}")
+
+        processed_data = {
+            "document_id": document_id,
+            "original_text": text,
+            "entities": [],
+            "temporal_metadata": None,
+            "cleaned_additional_metadata": {}
+        }
+
+        # Use custom config if provided
+        if custom_cleaning_config:
+            temp_config = self.cleaning_config
+            self.cleaning_config = TextCleanerConfig(custom_cleaning_config)
+
+        # Step 1: Clean text with NER protection
+        logger.debug("Cleaning main text with NER protection")
+        cleaned_text, entities = self.clean_text_with_ner_protection(text)
+        processed_data["cleaned_text"] = cleaned_text
+        processed_data["entities"] = entities
+
+        # Restore original config if temp was used
+        if custom_cleaning_config:
+            self.cleaning_config = temp_config
+
+        # Step 2: Clean metadata fields
+        logger.debug("Cleaning metadata fields")
+        processed_data["cleaned_title"] = self._clean_field(title)
+        processed_data["cleaned_excerpt"] = self._clean_field(excerpt)
+        processed_data["cleaned_author"] = self._clean_field(author)
+        processed_data["cleaned_publication_date"] = self._clean_field(publication_date)
+        processed_data["cleaned_revision_date"] = self._clean_field(revision_date)
+        processed_data["cleaned_source_url"] = self._clean_field(source_url)
+        processed_data["cleaned_categories"] = self._clean_field(categories)
+        processed_data["cleaned_tags"] = self._clean_field(tags)
+        processed_data["cleaned_media_asset_urls"] = self._clean_field(media_asset_urls)
+        processed_data["cleaned_geographical_data"] = self._clean_field(geographical_data)
+        processed_data["cleaned_embargo_date"] = self._clean_field(embargo_date)
+        processed_data["cleaned_sentiment"] = self._clean_field(sentiment)
+        processed_data["cleaned_word_count"] = self._clean_field(word_count)
+        processed_data["cleaned_publisher"] = self._clean_field(publisher)
+
+        # Step 3: Process additional metadata
+        if additional_metadata:
+            for key, value in additional_metadata.items():
+                cleaned_value = self._clean_field(value)
+                if cleaned_value is not None:
+                    processed_data["cleaned_additional_metadata"][f"cleaned_{key}"] = cleaned_value
+
+        # Step 4: Compute dynamic fields
+        if word_count is None and cleaned_text:
+            computed_word_count = len(cleaned_text.split())
+            processed_data["cleaned_word_count"] = computed_word_count
+        elif word_count is not None:
+            processed_data["cleaned_word_count"] = self._clean_field(word_count)
+
+        original_reading_time = additional_metadata.get('reading_time') if additional_metadata else None
+        if original_reading_time is None and processed_data.get("cleaned_word_count"):
+            reading_time = max(1, round(processed_data["cleaned_word_count"] / 200))
+            processed_data["cleaned_additional_metadata"]["cleaned_reading_time"] = reading_time
+        elif original_reading_time is not None:
+            processed_data["cleaned_additional_metadata"]["cleaned_reading_time"] = self._clean_field(original_reading_time)
+
+        original_language = additional_metadata.get('language') if additional_metadata else None
+        if original_language is None and cleaned_text:
+            language = self._detect_language(cleaned_text)
+            if language:
+                processed_data["cleaned_additional_metadata"]["cleaned_language"] = language
+        elif original_language is not None:
+            processed_data["cleaned_additional_metadata"]["cleaned_language"] = self._clean_field(original_language)
+
+        # Step 5: Extract temporal metadata
+        logger.debug("Extracting temporal metadata")
+        date_text_for_parsing = None
+        for ent in entities:
+            if ent.type == "DATE":
+                date_text_for_parsing = ent.text
+                break
+        if date_text_for_parsing is None:
+            date_text_for_parsing = cleaned_text
+
+        reference_date_for_temporal = publication_date if publication_date else date.today()
+        temporal_metadata = self.extract_temporal_metadata(
+            date_text_for_parsing, reference_date=reference_date_for_temporal)
+        processed_data["temporal_metadata"] = temporal_metadata
+
+        logger.info(
+            f"Preprocessing complete for document_id={document_id}. "
+            f"Found {len(entities)} entities, normalized date: {temporal_metadata}")
+        
+        return processed_data
+
+# src/core/processor.py
+
+===== END: ./src//core/processor.py =====
+
+===== FILE: ./src//main_cli.py =====
+"""
+src/main_cli.py
+
+CLI application using Click with auto-generated documentation support.
+
+ENHANCEMENTS:
+- Auto-generated Markdown documentation from CLI commands
+- OpenAPI-style documentation structure
+- Rich help text with examples
+- Documentation export command
+"""
+
+import sys
+import os
+import logging
+import click
+import json
+from pathlib import Path
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.table import Table
+from rich.panel import Panel
+from rich.markdown import Markdown
+from rich import print as rprint
+
+from src.main import preprocess_file
+from src.utils.config_manager import ConfigManager
+from src.utils.logger import setup_logging
+from src.core.processor import TextPreprocessor
+
+# Add src to the Python path if it's not already there.
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+src_dir = os.path.abspath(os.path.dirname(__file__))
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
+
+# Set up logging early in the entrypoint script
+settings = ConfigManager.get_settings()
+setup_logging()
+logger = logging.getLogger("ingestion_service")
+
+# Rich console for beautiful output
+console = Console()
+
+# Instantiate TextPreprocessor to ensure spaCy model is loaded
+try:
+    preprocessor = TextPreprocessor()
+    logger.info("TextPreprocessor initialized for CLI, spaCy model loaded.")
+except Exception as e:
+    console.print(
+        f"[bold red]Error:[/bold red] Failed to initialize TextPreprocessor: {e}")
+    sys.exit(1)
+
+
+# CLI Documentation metadata
+CLI_METADATA = {
+    "title": "Data Ingestion & Preprocessing CLI",
+    "version": "1.0.0",
+    "description": "A command-line interface for cleaning and preprocessing news articles with NLP enrichment.",
+    "author": "Data Engineering Team",
+    "contact": {
+        "name": "Support",
+        "email": "support@example.com",
+        "url": "https://github.com/your-repo"
+    }
+}
+
+
+def generate_cli_documentation(ctx, output_format='markdown'):
+    """
+    Generate comprehensive CLI documentation in OpenAPI-like format.
+    
+    Args:
+        ctx: Click context
+        output_format: 'markdown', 'json', or 'html'
+    
+    Returns:
+        Formatted documentation string
+    """
+    docs = {
+        "metadata": CLI_METADATA,
+        "commands": {}
+    }
+
+    # Iterate through all commands
+    for cmd_name, cmd in ctx.command.commands.items():
+        cmd_docs = {
+            "name": cmd_name,
+            "description": cmd.help or "No description available",
+            "usage": f"ingestion-cli {cmd_name} [OPTIONS]",
+            "options": [],
+            "examples": []
+        }
+
+        # Extract parameters/options
+        for param in cmd.params:
+            param_doc = {
+                "name": param.name,
+                "type": param.type.name if hasattr(param.type, 'name') else str(param.type),
+                "required": param.required,
+                "default": param.default if param.default is not None else "None",
+                # Use getattr for safety
+                "help": getattr(param, 'help', None) or "No description"
+            }
+
+            if isinstance(param, click.Option):
+                param_doc["flags"] = param.opts
+                param_doc["is_flag"] = param.is_flag
+            elif isinstance(param, click.Argument):
+                param_doc["flags"] = [param.name]
+                param_doc["is_argument"] = True
+
+            cmd_docs["options"].append(param_doc)
+
+        # Add command-specific examples
+        if cmd_name == "process":
+            cmd_docs["examples"] = [
+                {
+                    "description": "Process file locally (synchronous)",
+                    "command": "ingestion-cli process -i input.jsonl -o output.jsonl"
+                },
+                {
+                    "description": "Process with Celery (asynchronous)",
+                    "command": "ingestion-cli process -i input.jsonl -o output.jsonl --celery"
+                },
+                {
+                    "description": "Disable typo correction",
+                    "command": "ingestion-cli process -i input.jsonl -o output.jsonl --disable-typo-correction"
+                }
+            ]
+        elif cmd_name == "validate":
+            cmd_docs["examples"] = [
+                {
+                    "description": "Validate JSONL file",
+                    "command": "ingestion-cli validate input.jsonl"
+                }
+            ]
+        elif cmd_name == "test-model":
+            cmd_docs["examples"] = [
+                {
+                    "description": "Test with default text",
+                    "command": "ingestion-cli test-model"
+                },
+                {
+                    "description": "Test with custom text",
+                    "command": "ingestion-cli test-model --text \"Apple Inc. in San Francisco\""
+                }
+            ]
+
+        docs["commands"][cmd_name] = cmd_docs
+
+    # Format output
+    if output_format == 'json':
+        return json.dumps(docs, indent=2)
+    elif output_format == 'markdown':
+        return _format_markdown_docs(docs)
+    elif output_format == 'html':
+        return _format_html_docs(docs)
+    else:
+        return json.dumps(docs, indent=2)
+
+
+def _format_markdown_docs(docs):
+    """Format documentation as Markdown."""
+    md = f"# {docs['metadata']['title']}\n\n"
+    md += f"**Version:** {docs['metadata']['version']}\n\n"
+    md += f"{docs['metadata']['description']}\n\n"
+    md += f"**Contact:** {docs['metadata']['contact']['email']}\n\n"
+    md += "---\n\n"
+    md += "## Commands\n\n"
+
+    for cmd_name, cmd_info in docs["commands"].items():
+        md += f"### `{cmd_name}`\n\n"
+        md += f"{cmd_info['description']}\n\n"
+        md += f"**Usage:** `{cmd_info['usage']}`\n\n"
+
+        if cmd_info["options"]:
+            md += "**Options:**\n\n"
+            md += "| Option | Type | Required | Default | Description |\n"
+            md += "|--------|------|----------|---------|-------------|\n"
+            for opt in cmd_info["options"]:
+                flags = ', '.join(opt.get('flags', [opt['name']]))
+                md += f"| `{flags}` | {opt['type']} | {opt['required']} | {opt['default']} | {opt['help']} |\n"
+            md += "\n"
+
+        if cmd_info["examples"]:
+            md += "**Examples:**\n\n"
+            for ex in cmd_info["examples"]:
+                md += f"- {ex['description']}\n"
+                md += f"  ```bash\n  {ex['command']}\n  ```\n\n"
+
+        md += "---\n\n"
+
+    return md
+
+
+def _format_html_docs(docs):
+    """Format documentation as HTML."""
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>{docs['metadata']['title']}</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; }}
+        h1, h2, h3 {{ color: #333; }}
+        table {{ border-collapse: collapse; width: 100%; margin: 20px 0; }}
+        th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
+        th {{ background-color: #4CAF50; color: white; }}
+        code {{ background-color: #f4f4f4; padding: 2px 6px; border-radius: 3px; }}
+        pre {{ background-color: #f4f4f4; padding: 15px; border-radius: 5px; overflow-x: auto; }}
+        .command {{ background-color: #e7f3fe; padding: 15px; margin: 10px 0; border-left: 4px solid #2196F3; }}
+    </style>
+</head>
+<body>
+    <h1>{docs['metadata']['title']}</h1>
+    <p><strong>Version:</strong> {docs['metadata']['version']}</p>
+    <p>{docs['metadata']['description']}</p>
+    <p><strong>Contact:</strong> <a href="mailto:{docs['metadata']['contact']['email']}">{docs['metadata']['contact']['email']}</a></p>
+    <hr>
+    <h2>Commands</h2>
+"""
+
+    for cmd_name, cmd_info in docs["commands"].items():
+        html += f"""
+    <div class="command">
+        <h3>{cmd_name}</h3>
+        <p>{cmd_info['description']}</p>
+        <p><strong>Usage:</strong> <code>{cmd_info['usage']}</code></p>
+"""
+
+        if cmd_info["options"]:
+            html += """
+        <h4>Options</h4>
+        <table>
+            <tr>
+                <th>Option</th>
+                <th>Type</th>
+                <th>Required</th>
+                <th>Default</th>
+                <th>Description</th>
+            </tr>
+"""
+            for opt in cmd_info["options"]:
+                flags = ', '.join(opt.get('flags', [opt['name']]))
+                html += f"""
+            <tr>
+                <td><code>{flags}</code></td>
+                <td>{opt['type']}</td>
+                <td>{opt['required']}</td>
+                <td>{opt['default']}</td>
+                <td>{opt['help']}</td>
+            </tr>
+"""
+            html += "        </table>\n"
+
+        if cmd_info["examples"]:
+            html += "        <h4>Examples</h4>\n"
+            for ex in cmd_info["examples"]:
+                html += f"""
+        <p>{ex['description']}</p>
+        <pre><code>{ex['command']}</code></pre>
+"""
+
+        html += "    </div>\n"
+
+    html += """
+</body>
+</html>
+"""
+    return html
+
+
+@click.group()
+@click.version_option(version="1.0.0", prog_name="ingestion-cli")
+@click.pass_context
+def cli(ctx):
+    """
+    🧹 Data Ingestion & Preprocessing CLI
+    
+    A command-line interface for cleaning and preprocessing news articles.
+    Supports batch processing, Celery integration, and multiple storage backends.
+    
+    \b
+    Quick Start:
+        ingestion-cli info                    # Show system information
+        ingestion-cli test-model              # Test spaCy model
+        ingestion-cli validate input.jsonl    # Validate file
+        ingestion-cli process -i in.jsonl -o out.jsonl  # Process articles
+    
+    \b
+    Documentation:
+        ingestion-cli docs export --format markdown  # Export CLI docs
+        ingestion-cli docs show                      # View docs in terminal
+    
+    For detailed help on any command, use:
+        ingestion-cli COMMAND --help
+    """
+    ctx.ensure_object(dict)
+
+
+@cli.group(name="docs")
+def docs_group():
+    """📚 Documentation commands for CLI reference and export."""
+    pass
+
+
+@docs_group.command(name="show")
+@click.pass_context
+def show_docs(ctx):
+    """
+    Display CLI documentation in terminal.
+    
+    \b
+    Example:
+        ingestion-cli docs show
+    """
+    parent_ctx = ctx.parent.parent
+    docs_md = generate_cli_documentation(parent_ctx, output_format='markdown')
+
+    console.print("\n")
+    console.print(Markdown(docs_md))
+    console.print("\n")
+
+
+@docs_group.command(name="export")
+@click.option(
+    '--format',
+    type=click.Choice(['markdown', 'json', 'html'], case_sensitive=False),
+    default='markdown',
+    help='Output format for documentation'
+)
+@click.option(
+    '-o', '--output',
+    type=click.Path(dir_okay=False, writable=True),
+    default=None,
+    help='Output file path (prints to stdout if not specified)'
+)
+@click.pass_context
+def export_docs(ctx, format, output):
+    """
+    Export CLI documentation to file.
+    
+    \b
+    Examples:
+        ingestion-cli docs export --format markdown -o CLI_REFERENCE.md
+        ingestion-cli docs export --format json -o cli-schema.json
+        ingestion-cli docs export --format html -o cli-docs.html
+    """
+    parent_ctx = ctx.parent.parent
+    docs = generate_cli_documentation(parent_ctx, output_format=format)
+
+    if output:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(docs, encoding='utf-8')
+        console.print(
+            f"\n[bold green]✅ Documentation exported to:[/bold green] {output}\n")
+    else:
+        console.print(docs)
+
+
+@docs_group.command(name="openapi")
+@click.option(
+    '-o', '--output',
+    type=click.Path(dir_okay=False, writable=True),
+    default='cli-openapi.json',
+    help='Output file path for OpenAPI-style schema'
+)
+@click.pass_context
+def export_openapi_schema(ctx, output):
+    """
+    Export CLI commands as OpenAPI-style JSON schema.
+    
+    This generates a schema that mirrors the API's OpenAPI spec but for CLI commands.
+    Useful for generating client libraries or integration documentation.
+    
+    \b
+    Example:
+        ingestion-cli docs openapi -o cli-schema.json
+    """
+    parent_ctx = ctx.parent.parent
+
+    # Generate OpenAPI-style schema
+    schema = {
+        "openapi": "3.1.0",
+        "info": {
+            "title": CLI_METADATA["title"],
+            "version": CLI_METADATA["version"],
+            "description": CLI_METADATA["description"],
+            "contact": CLI_METADATA["contact"]
+        },
+        "commands": {}
+    }
+
+    for cmd_name, cmd in parent_ctx.command.commands.items():
+        cmd_schema = {
+            "summary": cmd.help or "No description",
+            "operationId": f"cli_{cmd_name}",
+            "parameters": []
+        }
+
+        for param in cmd.params:
+            param_schema = {
+                "name": param.name,
+                "in": "cli",
+                "required": param.required,
+                "schema": {
+                    "type": _map_click_type_to_json_type(param.type),
+                    "default": param.default if param.default is not None else None
+                },
+                # Use getattr for safety
+                "description": getattr(param, 'help', None) or ""
+            }
+
+            if isinstance(param, click.Option):
+                param_schema["flags"] = param.opts
+            elif isinstance(param, click.Argument):
+                param_schema["flags"] = [param.name]
+                param_schema["is_argument"] = True
+
+            cmd_schema["parameters"].append(param_schema)
+
+        schema["commands"][cmd_name] = cmd_schema
+
+    output_path = Path(output)
+    output_path.write_text(json.dumps(schema, indent=2), encoding='utf-8')
+    console.print(
+        f"\n[bold green]✅ OpenAPI schema exported to:[/bold green] {output}\n")
+
+
+def _map_click_type_to_json_type(click_type):
+    """Map Click parameter types to JSON Schema types."""
+    type_mapping = {
+        'STRING': 'string',
+        'INT': 'integer',
+        'FLOAT': 'number',
+        'BOOL': 'boolean',
+        'Path': 'string',
+        'Choice': 'string'
+    }
+    type_name = click_type.name if hasattr(
+        click_type, 'name') else str(click_type)
+    return type_mapping.get(type_name, 'string')
+
+
+@cli.command(name="process")
+@click.option(
+    '-i', '--input',
+    'input_path',
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    required=True,
+    help='Path to input JSONL file (one article per line)'
+)
+@click.option(
+    '-o', '--output',
+    'output_path',
+    type=click.Path(dir_okay=False, writable=True),
+    required=True,
+    help='Path to output JSONL file'
+)
+@click.option(
+    '--celery/--no-celery',
+    default=False,
+    help='Submit tasks to Celery workers (async) or process locally (sync)'
+)
+@click.option(
+    '--backends',
+    type=str,
+    default=None,
+    help='Comma-separated list of storage backends (e.g., "jsonl,postgresql,elasticsearch")'
+)
+@click.option(
+    '--disable-typo-correction',
+    is_flag=True,
+    default=False,
+    help='Disable typo correction for this batch'
+)
+@click.option(
+    '--disable-html-removal',
+    is_flag=True,
+    default=False,
+    help='Disable HTML tag removal'
+)
+@click.option(
+    '--disable-currency-standardization',
+    is_flag=True,
+    default=False,
+    help='Disable currency standardization ($100 → USD 100)'
+)
+def process_command(input_path: str, output_path: str, celery: bool, backends: str,
+                    disable_typo_correction: bool, disable_html_removal: bool,
+                    disable_currency_standardization: bool):
+    """
+    Process a JSONL file containing news articles.
+    
+    \b
+    Examples:
+        # Process locally (synchronous)
+        ingestion-cli process -i data/input.jsonl -o data/output.jsonl
+        
+        # Process with Celery (asynchronous)
+        ingestion-cli process -i data/input.jsonl -o data/output.jsonl --celery
+        
+        # Disable typo correction
+        ingestion-cli process -i data/input.jsonl -o data/output.jsonl --disable-typo-correction
+    """
+    console.print(
+        "\n[bold cyan]🚀 Starting Article Processing Pipeline[/bold cyan]\n")
+
+    # Build custom config if any flags set
+    custom_config = {}
+    if disable_typo_correction:
+        custom_config['enable_typo_correction'] = False
+    if disable_html_removal:
+        custom_config['remove_html_tags'] = False
+    if disable_currency_standardization:
+        custom_config['standardize_currency'] = False
+
+    # Display configuration
+    config_table = Table(title="Configuration",
+                         show_header=True, header_style="bold magenta")
+    config_table.add_column("Setting", style="cyan")
+    config_table.add_column("Value", style="green")
+
+    config_table.add_row("Input File", input_path)
+    config_table.add_row("Output File", output_path)
+    config_table.add_row(
+        "Processing Mode", "Celery (Async)" if celery else "Local (Sync)")
+    config_table.add_row("Storage Backends",
+                         backends if backends else "Default (from config)")
+    config_table.add_row("SpaCy Model", settings.ingestion_service.model_name)
+    config_table.add_row(
+        "GPU Enabled", "Yes" if settings.general.gpu_enabled else "No")
+
+    if custom_config:
+        config_table.add_row("Custom Config", str(custom_config))
+
+    console.print(config_table)
+    console.print()
+
+    try:
+        # Count total lines for progress tracking
+        with open(input_path, 'r', encoding='utf-8') as f:
+            total_lines = sum(1 for line in f if line.strip())
+
+        console.print(
+            f"[bold]Found {total_lines} articles to process[/bold]\n")
+
+        # Call the processing function - it now returns stats
+        stats = preprocess_file(
+            input_path=input_path,
+            output_path=output_path,
+            use_celery=celery,
+            custom_cleaning_config=custom_config if custom_config else None
+        )
+
+        # Display results with Rich formatting
+        console.print(f"\n[bold green]✅ Processing complete![/bold green]")
+
+        # Create results table
+        results_table = Table(title="Processing Results",
+                              show_header=True, header_style="bold magenta")
+        results_table.add_column("Metric", style="cyan")
+        results_table.add_column("Count", style="green", justify="right")
+
+        summary = stats.get_summary()
+        results_table.add_row("Total Lines", str(summary['total_lines']))
+        results_table.add_row("Processed Successfully", str(
+            summary['processed_successfully']))
+        results_table.add_row("JSON Decode Errors", str(
+            summary['json_decode_errors']))
+        results_table.add_row("Validation Errors", str(
+            summary['validation_errors']))
+        results_table.add_row("Processing Errors", str(
+            summary['processing_errors']))
+        results_table.add_row("Success Rate", summary['success_rate'])
+
+        console.print()
+        console.print(results_table)
+        console.print(f"\n[cyan]Results saved to:[/cyan] {output_path}")
+
+        if stats.errors:
+            console.print(
+                f"\n[yellow]⚠️  {len(stats.errors)} errors occurred during processing[/yellow]")
+            console.print(
+                f"[dim]See error details in: {output_path}.replace('.jsonl', '_errors.json')[/dim]")
+
+        console.print()
+
+    except FileNotFoundError as e:
+        console.print(
+            f"[bold red]❌ Error:[/bold red] Input file not found: {input_path}")
+        logger.error(f"File not found: {e}")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[bold red]❌ Error:[/bold red] {str(e)}")
+        logger.error(f"Processing failed: {e}", exc_info=True)
+        sys.exit(1)
+
+
+@cli.command(name="validate")
+@click.argument('input_path', type=click.Path(exists=True, dir_okay=False, readable=True))
+def validate_command(input_path: str):
+    """
+    Validate a JSONL file for correct format and schema.
+    
+    \b
+    Example:
+        ingestion-cli validate data/input.jsonl
+    """
+    console.print(
+        f"\n[bold cyan]🔍 Validating file:[/bold cyan] {input_path}\n")
+
+    from src.schemas.data_models import ArticleInput
+    import json
+    from pydantic import ValidationError
+
+    valid_count = 0
+    error_count = 0
+    errors = []
+
+    try:
+        with open(input_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console
+        ) as progress:
+            task = progress.add_task("[cyan]Validating...", total=len(lines))
+
+            for i, line in enumerate(lines, 1):
+                line = line.strip()
+                if not line:
+                    progress.advance(task)
+                    continue
+
+                try:
+                    article_data = json.loads(line)
+                    ArticleInput.model_validate(article_data)
+                    valid_count += 1
+                except json.JSONDecodeError as e:
+                    error_count += 1
+                    errors.append(f"Line {i}: Invalid JSON - {str(e)}")
+                except ValidationError as e:
+                    error_count += 1
+                    errors.append(
+                        f"Line {i}: Schema validation failed - {e.error_count()} errors")
+
+                progress.advance(task)
+
+        # Display results
+        console.print()
+        results_table = Table(title="Validation Results",
+                              show_header=True, header_style="bold magenta")
+        results_table.add_column("Metric", style="cyan")
+        results_table.add_column("Count", style="green")
+
+        results_table.add_row("Total Lines", str(len(lines)))
+        results_table.add_row("Valid Articles", str(valid_count))
+        results_table.add_row("Errors", str(error_count))
+
+        console.print(results_table)
+
+        if error_count > 0:
+            console.print(
+                f"\n[bold yellow]⚠️  Found {error_count} errors[/bold yellow]")
+            if len(errors) <= 10:
+                console.print("\n[bold]Error Details:[/bold]")
+                for error in errors:
+                    console.print(f"  [red]•[/red] {error}")
+            else:
+                console.print(f"\n[bold]First 10 errors:[/bold]")
+                for error in errors[:10]:
+                    console.print(f"  [red]•[/red] {error}")
+                console.print(
+                    f"\n  [dim]... and {len(errors) - 10} more errors[/dim]")
+        else:
+            console.print(
+                f"\n[bold green]✅ All articles are valid![/bold green]\n")
+
+        sys.exit(0 if error_count == 0 else 1)
+
+    except Exception as e:
+        console.print(f"[bold red]❌ Error:[/bold red] {str(e)}")
+        logger.error(f"Validation failed: {e}", exc_info=True)
+        sys.exit(1)
+
+
+@cli.command(name="info")
+def info_command():
+    """
+    Display system and configuration information.
+    """
+    console.print("\n[bold cyan]ℹ️  System Information[/bold cyan]\n")
+
+    info_table = Table(show_header=True, header_style="bold magenta")
+    info_table.add_column("Component", style="cyan")
+    info_table.add_column("Details", style="green")
+
+    # System info
+    info_table.add_row("CLI Version", "1.0.0")
+    info_table.add_row("Python Version", f"{sys.version.split()[0]}")
+
+    # Configuration
+    info_table.add_row("Log Level", settings.general.log_level)
+    info_table.add_row(
+        "GPU Enabled", "Yes" if settings.general.gpu_enabled else "No")
+    info_table.add_row("SpaCy Model", settings.ingestion_service.model_name)
+    info_table.add_row("Model Cache Dir",
+                       settings.ingestion_service.model_cache_dir)
+
+    # Cleaning pipeline
+    pipeline = settings.ingestion_service.cleaning_pipeline
+    info_table.add_row(
+        "Typo Correction", "Enabled" if pipeline.enable_typo_correction else "Disabled")
+    info_table.add_row(
+        "NER Protection", "Enabled" if pipeline.typo_correction.use_ner_entities else "Disabled")
+    info_table.add_row(
+        "HTML Removal", "Enabled" if pipeline.remove_html_tags else "Disabled")
+    info_table.add_row(
+        "Currency Std", "Enabled" if pipeline.standardize_currency else "Disabled")
+
+    # Celery
+    info_table.add_row("Celery Broker", settings.celery.broker_url)
+    info_table.add_row("Worker Concurrency", str(
+        settings.celery.worker_concurrency))
+
+    # Storage
+    enabled_backends = settings.storage.enabled_backends
+    info_table.add_row("Storage Backends", ", ".join(
+        enabled_backends) if enabled_backends else "None")
+
+    console.print(info_table)
+    console.print()
+
+
+@cli.command(name="test-model")
+@click.option(
+    '--text',
+    type=str,
+    default="This is a test article about artificial intelligence and machine learning.",
+    help='Test text to process'
+)
+@click.option(
+    '--disable-typo-correction',
+    is_flag=True,
+    default=False,
+    help='Disable typo correction for this test'
+)
+def test_model_command(text: str, disable_typo_correction: bool):
+    """
+    Test the spaCy model with sample text using NER-protected cleaning.
+    
+    \b
+    Example:
+        ingestion-cli test-model --text "Apple Inc. in San Francisco"
+        ingestion-cli test-model --text "Your text" --disable-typo-correction
+    """
+    console.print("\n[bold cyan]🧪 Testing SpaCy Model[/bold cyan]\n")
+
+    try:
+        # Build custom config if flag set
+        custom_config = None
+        if disable_typo_correction:
+            custom_config = {'enable_typo_correction': False}
+            # Temporarily update preprocessor config
+            from src.utils.text_cleaners import TextCleanerConfig
+            preprocessor.cleaning_config = TextCleanerConfig(custom_config)
+
+        with console.status("[bold green]Processing text..."):
+            # Use NER-protected cleaning
+            cleaned_text, entities = preprocessor.clean_text_with_ner_protection(
+                text)
+
+        console.print(f"[bold]Original Text:[/bold]\n{text}\n")
+        console.print(f"[bold]Cleaned Text:[/bold]\n{cleaned_text}\n")
+
+        if entities:
+            console.print(
+                f"[bold green]Found {len(entities)} entities:[/bold green]\n")
+
+            entity_table = Table(show_header=True, header_style="bold magenta")
+            entity_table.add_column("Entity", style="cyan")
+            entity_table.add_column("Type", style="green")
+            entity_table.add_column("Position", style="yellow")
+
+            for entity in entities:
+                entity_table.add_row(
+                    entity.text,
+                    entity.type,
+                    f"{entity.start_char}-{entity.end_char}"
+                )
+
+            console.print(entity_table)
+        else:
+            console.print("[yellow]No entities found[/yellow]")
+
+        # Show config used
+        if disable_typo_correction:
+            console.print(
+                f"\n[dim]Note: Typo correction was disabled for this test[/dim]")
+
+        console.print(f"\n[bold green]✅ Model test complete![/bold green]\n")
+
+    except Exception as e:
+        console.print(f"[bold red]❌ Error:[/bold red] {str(e)}")
+        logger.error(f"Model test failed: {e}", exc_info=True)
+        sys.exit(1)
+
+
+def main():
+    """
+    Main function to run the CLI application.
+    """
+    try:
+        cli()
+    except Exception as e:
+        console.print(f"[bold red]❌ Unexpected error:[/bold red] {str(e)}")
+        logger.critical(f"CLI crashed: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+# src/main_cli.py
+
+
+===== END: ./src//main_cli.py =====
+
+===== FILE: ./src//storage/backends.py =====
+# src/storage/backends.py
+"""
+src/storage/backends.py
+
+Defines abstract and concrete storage backend implementations for
+processed articles (JSONL, Elasticsearch, PostgreSQL),
+and a factory to retrieve them based on configuration.
+
+FIXES APPLIED:
+- Fix #2: PostgreSQL connection pooling (5-20 connections)
+- Fix #3: Elasticsearch bulk insert with 500-item batching
+- Fix #6: Retry logic with exponential backoff for all backends
+"""
+
+import atexit
+import json
+import logging
+import os
+from abc import ABC, abstractmethod
+from typing import Dict, Any, List, Optional, Union
+from datetime import date, datetime
+from pathlib import Path
+
+# Tenacity for retry logic
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log
+)
+
+# Conditional imports for database clients - they are only imported when the class is instantiated
+try:
+    from elasticsearch import Elasticsearch, helpers as es_helpers
+except ImportError:
+    Elasticsearch = None
+    es_helpers = None
+
+try:
+    import psycopg2
+    from psycopg2 import pool as psycopg2_pool
+    from psycopg2 import sql as pg_sql
+    from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+except ImportError:
+    psycopg2 = None
+    psycopg2_pool = None
+    pg_sql = None
+    ISOLATION_LEVEL_AUTOCOMMIT = None
+
+from src.schemas.data_models import PreprocessSingleResponse
+from src.utils.config_manager import (
+    ConfigManager,
+    JsonlStorageConfig,
+    ElasticsearchStorageConfig,
+    PostgreSQLStorageConfig
+)
+
+logger = logging.getLogger("ingestion_service")
+
+# Constants for retry and batching
+MAX_RETRY_ATTEMPTS = 3
+RETRY_MIN_WAIT = 2  # seconds
+RETRY_MAX_WAIT = 10  # seconds
+ES_BATCH_SIZE = 500  # Elasticsearch recommendation
+
+
+class StorageBackend(ABC):
+    """Abstract Base Class for storage backends."""
+    @abstractmethod
+    def initialize(self):
+        """Initializes the storage backend (e.g., establish connection, create directories/tables)."""
+        pass
+
+    @abstractmethod
+    def save(self, data: PreprocessSingleResponse, **kwargs: Any) -> None:
+        """Saves a single processed article."""
+        pass
+
+    @abstractmethod
+    def save_batch(self, data_list: List[PreprocessSingleResponse], **kwargs: Any) -> None:
+        """Saves a batch of processed articles."""
+        pass
+
+    @abstractmethod
+    def close(self):
+        """Closes any open connections or resources."""
+        pass
+
+
+class JSONLStorageBackend(StorageBackend):
+    """
+    Storage backend that saves processed articles to a daily-created JSONL (JSON Lines) file.
+    Each line in the file is a JSON object.
+    
+    IMPROVEMENTS:
+    - Retry logic with exponential backoff for file write failures
+    - Better error handling and logging
+    """
+
+    def __init__(self, config: JsonlStorageConfig):
+        self.output_directory = Path(config.output_path).parent
+        self.current_file_path: Optional[Path] = None
+        self._file_handle = None
+        self._current_date: Optional[date] = None
+        logger.info(
+            f"Initialized JSONLStorageBackend with output directory: {self.output_directory}")
+
+    def initialize(self):
+        """
+        Ensures the output directory exists and is writable.
+        """
+        try:
+            self.output_directory.mkdir(parents=True, exist_ok=True)
+            # Verify directory is writable
+            if not os.access(self.output_directory, os.W_OK):
+                raise PermissionError(
+                    f"Output directory {self.output_directory} is not writable.")
+            logger.info(
+                f"JSONL storage directory ensured: {self.output_directory}")
+        except Exception as e:
+            logger.critical(
+                f"Failed to create or verify JSONL output directory {self.output_directory}: {e}")
+            raise
+
+    def _get_daily_file_path(self) -> Path:
+        """Generates the file path for today's JSONL file."""
+        today_str = date.today().strftime("%Y-%m-%d")
+        return self.output_directory / f"processed_articles_{today_str}.jsonl"
+
+    def _open_file(self):
+        """Opens or re-opens the daily file for appending."""
+        new_file_path = self._get_daily_file_path()
+        today = date.today()
+
+        if self._file_handle is None or new_file_path != self.current_file_path or today != self._current_date:
+            self.close()  # Close existing handle if file path or date changed
+
+            self.current_file_path = new_file_path
+            self._current_date = today
+            try:
+                self._file_handle = open(
+                    self.current_file_path, 'a', encoding='utf-8')
+                logger.info(
+                    f"Opened JSONL file for appending: {self.current_file_path}")
+            except Exception as e:
+                logger.critical(
+                    f"Failed to open JSONL file {self.current_file_path}: {e}", exc_info=True)
+                raise
+
+    def _serialize_data(self, data: PreprocessSingleResponse) -> Dict[str, Any]:
+        """
+        Serializes PreprocessSingleResponse to a dictionary, handling Pydantic models
+        and datetime/date objects.
+        """
+        return data.model_dump(mode='json')
+
+    @retry(
+        stop=stop_after_attempt(MAX_RETRY_ATTEMPTS),
+        wait=wait_exponential(
+            multiplier=1, min=RETRY_MIN_WAIT, max=RETRY_MAX_WAIT),
+        retry=retry_if_exception_type((IOError, OSError)),
+        before_sleep=before_sleep_log(logger, logging.WARNING)
+    )
+    def save(self, data: PreprocessSingleResponse, **kwargs: Any) -> None:
+        """
+        Saves a single processed article to the JSONL file.
+        
+        IMPROVEMENT: Retry logic handles transient file system errors.
+        """
+        try:
+            self._open_file()
+            serialized_data = self._serialize_data(data)
+            json_line = json.dumps(serialized_data, ensure_ascii=False)
+            self._file_handle.write(json_line + '\n')
+            self._file_handle.flush()  # Ensure data is written to disk
+            os.fsync(self._file_handle.fileno())  # Force disk sync
+            logger.debug(
+                f"Saved single document {data.document_id} to JSONL file: {self.current_file_path}")
+        except Exception as e:
+            logger.error(
+                f"Failed to write record {data.document_id} to JSONL file {self.current_file_path}: {e}",
+                exc_info=True)
+            raise
+
+    @retry(
+        stop=stop_after_attempt(MAX_RETRY_ATTEMPTS),
+        wait=wait_exponential(
+            multiplier=1, min=RETRY_MIN_WAIT, max=RETRY_MAX_WAIT),
+        retry=retry_if_exception_type((IOError, OSError)),
+        before_sleep=before_sleep_log(logger, logging.WARNING)
+    )
+    def save_batch(self, data_list: List[PreprocessSingleResponse], **kwargs: Any) -> None:
+        """
+        Saves a batch of processed articles to the JSONL file.
+        
+        IMPROVEMENT: Retry logic handles transient file system errors.
+        """
+        if not data_list:
+            logger.debug(
+                "Attempted to save an empty batch to JSONL. Skipping.")
+            return
+
+        try:
+            self._open_file()
+            for data in data_list:
+                serialized_data = self._serialize_data(data)
+                json_line = json.dumps(serialized_data, ensure_ascii=False)
+                self._file_handle.write(json_line + '\n')
+            self._file_handle.flush()  # Ensure data is written to disk
+            os.fsync(self._file_handle.fileno())  # Force disk sync
+            logger.info(
+                f"Saved batch of {len(data_list)} documents to JSONL file: {self.current_file_path}")
+        except Exception as e:
+            logger.error(
+                f"Failed to save batch to JSONL file {self.current_file_path}: {e}",
+                exc_info=True)
+            raise
+
+    def close(self):
+        """Closes the current file handle if open."""
+        if self._file_handle:
+            try:
+                self._file_handle.flush()  # Ensure any buffered data is written
+                os.fsync(self._file_handle.fileno())  # Force disk sync
+                self._file_handle.close()
+                logger.info(
+                    f"Closed JSONL file handle: {self.current_file_path}")
+            except Exception as e:
+                logger.error(
+                    f"Error closing JSONL file {self.current_file_path}: {e}",
+                    exc_info=True)
+            finally:
+                self._file_handle = None
+                self.current_file_path = None
+                self._current_date = None
+
+
+class ElasticsearchStorageBackend(StorageBackend):
+    """
+    Storage backend that saves processed articles to Elasticsearch.
+    Requires Elasticsearch client to be installed and connection details.
+    
+    IMPROVEMENTS:
+    - Fix #3: Bulk insert with 500-item batching to prevent OOM
+    - Fix #6: Retry logic with exponential backoff for network failures
+    """
+
+    def __init__(self, config: ElasticsearchStorageConfig):
+        if Elasticsearch is None:
+            raise ImportError(
+                "Elasticsearch client is not installed. Please install it with 'pip install elasticsearch'.")
+
+        self.config = config
+        self.es: Optional[Elasticsearch] = None
+        self.index_name = config.index_name
+        logger.info(
+            f"Initialized ElasticsearchStorageBackend for index: {self.index_name} at {config.host}:{config.port}")
+
+    def initialize(self):
+        """Initializes the Elasticsearch client and ensures the index exists."""
+        if self.es:
+            return
+
+        try:
+            connection_params = {
+                "hosts": [{"host": self.config.host, "port": self.config.port, "scheme": self.config.scheme}]
+            }
+            if self.config.api_key:
+                connection_params["api_key"] = self.config.api_key
+            self.es = Elasticsearch(**connection_params)
+            if not self.es.ping():
+                raise ConnectionError("Could not connect to Elasticsearch.")
+            logger.info("Successfully connected to Elasticsearch.")
+            self._ensure_index()
+        except Exception as e:
+            logger.critical(
+                f"Failed to initialize Elasticsearch connection or ensure index '{self.index_name}': {e}",
+                exc_info=True)
+            self.es = None
+            raise
+
+    def _ensure_index(self):
+        """Ensures the Elasticsearch index exists."""
+        if not self.es:
+            logger.error(
+                "Elasticsearch client not initialized. Cannot ensure index.")
+            return
+
+        try:
+            if not self.es.indices.exists(index=self.index_name):
+                self.es.indices.create(index=self.index_name)
+                logger.info(
+                    f"Elasticsearch index '{self.index_name}' created.")
+            else:
+                logger.debug(
+                    f"Elasticsearch index '{self.index_name}' already exists.")
+        except Exception as e:
+            logger.error(
+                f"Failed to check/create Elasticsearch index '{self.index_name}': {e}",
+                exc_info=True)
+            raise
+
+    def _prepare_doc(self, data: PreprocessSingleResponse) -> Dict[str, Any]:
+        """
+        Prepares a single PreprocessSingleResponse for Elasticsearch indexing.
+        Converts Pydantic model to a dictionary suitable for ES,
+        handling dates and HttpUrls for JSON serialization.
+        """
+        doc = data.model_dump(mode='json')
+        return doc
+
+    @retry(
+        stop=stop_after_attempt(MAX_RETRY_ATTEMPTS),
+        wait=wait_exponential(
+            multiplier=1, min=RETRY_MIN_WAIT, max=RETRY_MAX_WAIT),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+        before_sleep=before_sleep_log(logger, logging.WARNING)
+    )
+    def save(self, data: PreprocessSingleResponse, **kwargs: Any) -> None:
+        """
+        Saves a single processed article to Elasticsearch.
+        
+        IMPROVEMENT: Retry logic handles transient network failures.
+        """
+        if not self.es:
+            logger.error(
+                f"Elasticsearch client not initialized. Skipping save for document {data.document_id}.")
+            return
+
+        doc = self._prepare_doc(data)
+        try:
+            response = self.es.index(
+                index=self.index_name, id=data.document_id, document=doc)
+            logger.debug(
+                f"Saved document {data.document_id} to Elasticsearch. Response: {response['result']}")
+        except Exception as e:
+            logger.error(
+                f"Failed to save document {data.document_id} to Elasticsearch: {e}",
+                exc_info=True)
+            raise
+
+    @retry(
+        stop=stop_after_attempt(MAX_RETRY_ATTEMPTS),
+        wait=wait_exponential(
+            multiplier=1, min=RETRY_MIN_WAIT, max=RETRY_MAX_WAIT),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+        before_sleep=before_sleep_log(logger, logging.WARNING)
+    )
+    def save_batch(self, data_list: List[PreprocessSingleResponse], **kwargs: Any) -> None:
+        """
+        Saves a batch of processed articles to Elasticsearch using bulk API.
+        
+        IMPROVEMENTS:
+        - Fix #3: Batches into 500-item chunks to prevent OOM and ES rejection
+        - Fix #6: Retry logic for network failures
+        """
+        if not self.es:
+            logger.error(
+                "Elasticsearch client not initialized. Skipping batch save.")
+            return
+        if not data_list:
+            logger.debug(
+                "Attempted to save an empty batch to Elasticsearch. Skipping.")
+            return
+        if es_helpers is None:
+            logger.error(
+                "Elasticsearch helpers not imported. Cannot perform bulk save.")
+            raise ImportError(
+                "Elasticsearch helpers module is required for bulk operations.")
+
+        # Process in batches of ES_BATCH_SIZE (500)
+        total_success = 0
+        total_errors = []
+
+        for i in range(0, len(data_list), ES_BATCH_SIZE):
+            batch = data_list[i:i+ES_BATCH_SIZE]
+            actions = [
+                {
+                    "_index": self.index_name,
+                    "_id": data.document_id,
+                    "_source": self._prepare_doc(data)
+                }
+                for data in batch
+            ]
+            try:
+                success_count, errors = es_helpers.bulk(
+                    self.es, actions, chunk_size=ES_BATCH_SIZE, stats_only=False)
+                total_success += success_count
+                if errors:
+                    total_errors.extend(errors)
+                    for error in errors:
+                        logger.error(f"Elasticsearch bulk save error: {error}")
+                logger.debug(
+                    f"Processed ES batch {i//ES_BATCH_SIZE + 1}: {success_count} successes, "
+                    f"{len(errors)} errors")
+            except Exception as e:
+                logger.error(
+                    f"Failed to save batch chunk to Elasticsearch (items {i}-{i+len(batch)}): {e}",
+                    exc_info=True)
+                raise
+
+        logger.info(
+            f"Successfully saved {total_success} of {len(data_list)} documents to Elasticsearch "
+            f"(with {len(total_errors)} errors).")
+
+    def close(self):
+        """Closes the Elasticsearch client connection."""
+        if self.es:
+            logger.debug(
+                "Elasticsearch client does not require explicit close for HTTP connections.")
+            self.es = None
+
+
+class PostgreSQLStorageBackend(StorageBackend):
+    """
+    Storage backend that saves processed articles to PostgreSQL.
+    Requires psycopg2-binary client to be installed.
+    
+    IMPROVEMENTS:
+    - Fix #2: Connection pooling (5-20 connections) for high concurrency
+    - Fix #6: Retry logic with exponential backoff for network failures
+    """
+
+    # Class-level connection pool (shared across instances)
+    _connection_pool: Optional[Any] = None
+    _pool_lock = None  # Will be initialized with threading.Lock()
+
+    def __init__(self, config: PostgreSQLStorageConfig):
+        if psycopg2 is None:
+            raise ImportError(
+                "psycopg2-binary is not installed. Please install it with 'pip install psycopg2-binary'.")
+
+        self.config = config
+        self.conn_params = {
+            "host": config.host,
+            "port": config.port,
+            "dbname": config.dbname,
+            "user": config.user,
+            "password": config.password
+        }
+        self.table_name = config.table_name
+        self._connection: Optional[psycopg2.extensions.connection] = None
+
+        # Initialize lock for thread-safe pool access
+        if PostgreSQLStorageBackend._pool_lock is None:
+            import threading
+            PostgreSQLStorageBackend._pool_lock = threading.Lock()
+
+        logger.info(
+            f"Initialized PostgreSQLStorageBackend for table: {self.table_name} on "
+            f"{config.host}:{config.port}/{config.dbname}")
+
+    def _get_or_create_pool(self):
+        """
+        Creates or returns the connection pool.
+        Thread-safe initialization of the class-level pool.
+        """
+        with PostgreSQLStorageBackend._pool_lock:
+            if PostgreSQLStorageBackend._connection_pool is None:
+                try:
+                    PostgreSQLStorageBackend._connection_pool = psycopg2_pool.ThreadedConnectionPool(
+                        minconn=5,
+                        maxconn=20,
+                        **self.conn_params
+                    )
+                    logger.info(
+                        "PostgreSQL connection pool created (5-20 connections)")
+                except Exception as e:
+                    logger.critical(
+                        f"Failed to create PostgreSQL connection pool: {e}", exc_info=True)
+                    raise
+            return PostgreSQLStorageBackend._connection_pool
+
+    def _get_connection(self) -> psycopg2.extensions.connection:
+        """Gets a connection from the pool."""
+        pool = self._get_or_create_pool()
+        try:
+            conn = pool.getconn()
+            conn.autocommit = False
+            logger.debug("Retrieved connection from PostgreSQL pool")
+            return conn
+        except Exception as e:
+            logger.critical(
+                f"Failed to get connection from PostgreSQL pool: {e}", exc_info=True)
+            raise
+
+    def _return_connection(self, conn: psycopg2.extensions.connection):
+        """Returns a connection to the pool."""
+        if conn and PostgreSQLStorageBackend._connection_pool:
+            PostgreSQLStorageBackend._connection_pool.putconn(conn)
+            logger.debug("Returned connection to PostgreSQL pool")
+
+    def initialize(self):
+        """
+        Connects to the database and ensures the table exists.
+        Handles database creation if it doesn't exist, by connecting to default 'postgres' db.
+        """
+        temp_conn_params = self.conn_params.copy()
+        temp_db_name = temp_conn_params.pop("dbname")
+        temp_conn_params["dbname"] = "postgres"
+
+        temp_conn = None
+        try:
+            temp_conn = psycopg2.connect(**temp_conn_params)
+            temp_conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+            cur = temp_conn.cursor()
+            cur.execute(pg_sql.SQL(
+                "SELECT 1 FROM pg_database WHERE datname = %s;"), [temp_db_name])
+            if cur.fetchone() is None:
+                cur.execute(pg_sql.SQL("CREATE DATABASE {};").format(
+                    pg_sql.Identifier(temp_db_name)))
+                logger.info(f"PostgreSQL database '{temp_db_name}' created.")
+            else:
+                logger.debug(
+                    f"PostgreSQL database '{temp_db_name}' already exists.")
+            cur.close()
+        except Exception as e:
+            logger.warning(
+                f"Could not create PostgreSQL database '{temp_db_name}' "
+                f"(might already exist or permissions issue): {e}")
+        finally:
+            if temp_conn:
+                temp_conn.close()
+
+        # Initialize the connection pool
+        self._get_or_create_pool()
+
+        # Create table using a connection from the pool
+        conn = self._get_connection()
+        try:
+            self._create_table_if_not_exists(conn)
+            logger.info(f"PostgreSQL backend initialized and connected.")
+        except Exception as e:
+            logger.critical(
+                f"Failed to initialize PostgreSQL backend: {e}", exc_info=True)
+            raise
+        finally:
+            self._return_connection(conn)
+
+    def _create_table_if_not_exists(self, conn: psycopg2.extensions.connection):
+        """Creates the PostgreSQL table if it doesn't exist."""
+        cur = None
+        try:
+            cur = conn.cursor()
+            create_table_query = pg_sql.SQL("""
+            CREATE TABLE IF NOT EXISTS {} (
+                document_id VARCHAR(255) PRIMARY KEY,
+                version VARCHAR(50),
+                original_text TEXT,
+                cleaned_text TEXT,
+                cleaned_title TEXT,
+                cleaned_excerpt TEXT,
+                cleaned_author TEXT,
+                cleaned_publication_date DATE,
+                cleaned_revision_date DATE,
+                cleaned_source_url TEXT,
+                cleaned_categories JSONB,
+                cleaned_tags JSONB,
+                cleaned_media_asset_urls JSONB,
+                cleaned_geographical_data JSONB,
+                cleaned_embargo_date DATE,
+                cleaned_sentiment TEXT,
+                cleaned_word_count INTEGER,
+                cleaned_publisher TEXT,
+                temporal_metadata DATE,
+                entities JSONB,
+                cleaned_additional_metadata JSONB,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            """).format(pg_sql.Identifier(self.table_name))
+            cur.execute(create_table_query)
+            conn.commit()
+            logger.info(
+                f"PostgreSQL table '{self.table_name}' ensured to exist.")
+        except Exception as e:
+            logger.critical(
+                f"Failed to create PostgreSQL table '{self.table_name}': {e}",
+                exc_info=True)
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if cur:
+                cur.close()
+
+    def _prepare_sql_data(self, data: PreprocessSingleResponse) -> Dict[str, Any]:
+        """
+        Prepares a single PreprocessSingleResponse for SQL insertion.
+        Converts Pydantic models/types to suitable SQL types.
+        """
+        temporal_metadata_date = None
+        if data.temporal_metadata:
+            try:
+                temporal_metadata_date = datetime.strptime(
+                    data.temporal_metadata, '%Y-%m-%d').date()
+            except ValueError:
+                logger.warning(
+                    f"Invalid temporal_metadata date format for document {data.document_id}: "
+                    f"{data.temporal_metadata}. Storing as NULL.")
+
+        return {
+            "document_id": data.document_id,
+            "version": data.version,
+            "original_text": data.original_text,
+            "cleaned_text": data.cleaned_text,
+            "cleaned_title": data.cleaned_title,
+            "cleaned_excerpt": data.cleaned_excerpt,
+            "cleaned_author": data.cleaned_author,
+            "cleaned_publication_date": data.cleaned_publication_date,
+            "cleaned_revision_date": data.cleaned_revision_date,
+            "cleaned_source_url": str(data.cleaned_source_url) if data.cleaned_source_url else None,
+            "cleaned_categories": json.dumps(data.cleaned_categories) if data.cleaned_categories is not None else None,
+            "cleaned_tags": json.dumps(data.cleaned_tags) if data.cleaned_tags is not None else None,
+            "cleaned_media_asset_urls": json.dumps([str(url) for url in data.cleaned_media_asset_urls]) if data.cleaned_media_asset_urls is not None else None,
+            "cleaned_geographical_data": json.dumps(data.cleaned_geographical_data) if data.cleaned_geographical_data is not None else None,
+            "cleaned_embargo_date": data.cleaned_embargo_date,
+            "cleaned_sentiment": data.cleaned_sentiment,
+            "cleaned_word_count": data.cleaned_word_count,
+            "cleaned_publisher": data.cleaned_publisher,
+            "temporal_metadata": temporal_metadata_date,
+            "entities": json.dumps([entity.model_dump(mode='json') for entity in data.entities]),
+            "cleaned_additional_metadata": json.dumps(data.cleaned_additional_metadata) if data.cleaned_additional_metadata is not None else None
+        }
+
+    @retry(
+        stop=stop_after_attempt(MAX_RETRY_ATTEMPTS),
+        wait=wait_exponential(
+            multiplier=1, min=RETRY_MIN_WAIT, max=RETRY_MAX_WAIT),
+        retry=retry_if_exception_type(
+            (psycopg2.OperationalError, psycopg2.InterfaceError)),
+        before_sleep=before_sleep_log(logger, logging.WARNING)
+    )
+    def save(self, data: PreprocessSingleResponse, **kwargs: Any) -> None:
+        """
+        Saves a single processed article to PostgreSQL.
+        
+        IMPROVEMENT: Uses connection pool and retry logic for resilience.
+        """
+        conn = self._get_connection()
+        prepared_data = self._prepare_sql_data(data)
+        cur = None
+        try:
+            cur = conn.cursor()
+            columns = pg_sql.SQL(', ').join(
+                map(pg_sql.Identifier, prepared_data.keys()))
+            placeholders = pg_sql.SQL(', ').join(
+                pg_sql.Placeholder() * len(prepared_data))
+            update_columns = pg_sql.SQL(', ').join(
+                pg_sql.SQL('{} = EXCLUDED.{}').format(
+                    pg_sql.Identifier(col), pg_sql.Identifier(col))
+                for col in prepared_data.keys() if col != 'document_id'
+            )
+
+            insert_query = pg_sql.SQL(
+                "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT (document_id) DO UPDATE SET {};"
+            ).format(
+                pg_sql.Identifier(self.table_name),
+                columns,
+                placeholders,
+                update_columns
+            )
+
+            cur.execute(insert_query, tuple(prepared_data.values()))
+            conn.commit()
+            logger.debug(
+                f"Saved single document {data.document_id} to PostgreSQL.")
+        except Exception as e:
+            logger.error(
+                f"Failed to save document {data.document_id} to PostgreSQL: {e}",
+                exc_info=True)
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if cur:
+                cur.close()
+            self._return_connection(conn)
+
+    @retry(
+        stop=stop_after_attempt(MAX_RETRY_ATTEMPTS),
+        wait=wait_exponential(
+            multiplier=1, min=RETRY_MIN_WAIT, max=RETRY_MAX_WAIT),
+        retry=retry_if_exception_type(
+            (psycopg2.OperationalError, psycopg2.InterfaceError)),
+        before_sleep=before_sleep_log(logger, logging.WARNING)
+    )
+    def save_batch(self, data_list: List[PreprocessSingleResponse], **kwargs: Any) -> None:
+        """
+        Saves a batch of processed articles to PostgreSQL using executemany.
+        
+        IMPROVEMENT: Uses connection pool and retry logic for resilience.
+        """
+        if not data_list:
+            logger.debug(
+                "Attempted to save an empty batch to PostgreSQL. Skipping.")
+            return
+
+        conn = self._get_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            first_data = self._prepare_sql_data(data_list[0])
+            columns = pg_sql.SQL(', ').join(
+                map(pg_sql.Identifier, first_data.keys()))
+            placeholders = pg_sql.SQL(', ').join(
+                pg_sql.Placeholder() * len(first_data))
+            update_columns = pg_sql.SQL(', ').join(
+                pg_sql.SQL('{} = EXCLUDED.{}').format(
+                    pg_sql.Identifier(col), pg_sql.Identifier(col))
+                for col in first_data.keys() if col != 'document_id'
+            )
+
+            insert_query = pg_sql.SQL(
+                "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT (document_id) DO UPDATE SET {};"
+            ).format(
+                pg_sql.Identifier(self.table_name),
+                columns,
+                placeholders,
+                update_columns
+            )
+
+            batch_values = [tuple(self._prepare_sql_data(
+                data).values()) for data in data_list]
+            cur.executemany(insert_query, batch_values)
+            conn.commit()
+            logger.info(
+                f"Saved batch of {len(data_list)} documents to PostgreSQL.")
+        except Exception as e:
+            logger.error(
+                f"Failed to save batch to PostgreSQL: {e}",
+                exc_info=True)
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if cur:
+                cur.close()
+            self._return_connection(conn)
+
+    def close(self):
+        """Closes the PostgreSQL connection."""
+        if self._connection:
+            try:
+                self._return_connection(self._connection)
+                logger.info("PostgreSQL connection returned to pool.")
+            except Exception as e:
+                logger.error(
+                    f"Error returning PostgreSQL connection to pool: {e}",
+                    exc_info=True)
+            finally:
+                self._connection = None
+
+
+class StorageBackendFactory:
+    """
+    Factory to create and provide appropriate storage backend instances based on configuration.
+    Manages the lifecycle of backends to ensure proper initialization and closing.
+    """
+    _initialized_backends: Dict[str, StorageBackend] = {}
+
+    @classmethod
+    def get_backends(cls, requested_backends: Optional[List[str]] = None) -> List[StorageBackend]:
+        """
+        Returns a list of initialized StorageBackend instances.
+
+        Args:
+            requested_backends: Optional list of backend names to activate for a specific request.
+                                If None or empty, uses the 'enabled_backends' from settings.
+                                These must be a subset of the configured 'enabled_backends'.
+
+        Returns:
+            A list of initialized StorageBackend instances.
+
+        Raises:
+            ValueError: If a requested or enabled backend is not configured or supported.
+            ImportError: If a required library for a backend is not installed.
+            ConnectionError: If a backend fails to initialize its connection.
+        """
+        settings = ConfigManager.get_settings()
+        storage_config = settings.storage
+
+        backends_to_use = []
+        if requested_backends:
+            for backend_name in requested_backends:
+                if backend_name in storage_config.enabled_backends:
+                    backends_to_use.append(backend_name)
+                else:
+                    logger.warning(
+                        f"Requested backend '{backend_name}' is not enabled in settings. Skipping.")
+        else:
+            backends_to_use = storage_config.enabled_backends
+
+        if not backends_to_use:
+            logger.info(
+                "No storage backends enabled or requested. Defaulting to 'jsonl'.")
+            backends_to_use = ["jsonl"]
+
+        active_backends: List[StorageBackend] = []
+
+        for backend_name in backends_to_use:
+            backend_name_lower = backend_name.lower()
+
+            if backend_name_lower not in cls._initialized_backends:
+                try:
+                    if backend_name_lower == "jsonl":
+                        if not storage_config.jsonl:
+                            raise ValueError(
+                                f"JSONL backend specified but not configured in settings.yaml")
+                        backend = JSONLStorageBackend(
+                            config=storage_config.jsonl)
+                    elif backend_name_lower == "elasticsearch":
+                        if not storage_config.elasticsearch:
+                            raise ValueError(
+                                f"Elasticsearch backend specified but not configured in settings.yaml")
+                        backend = ElasticsearchStorageBackend(
+                            config=storage_config.elasticsearch)
+                    elif backend_name_lower == "postgresql":
+                        if not storage_config.postgresql:
+                            raise ValueError(
+                                f"PostgreSQL backend specified but not configured in settings.yaml")
+                        backend = PostgreSQLStorageBackend(
+                            config=storage_config.postgresql)
+                    else:
+                        raise ValueError(
+                            f"Unsupported or unconfigured storage backend type: '{backend_name}'.")
+
+                    backend.initialize()
+                    cls._initialized_backends[backend_name_lower] = backend
+                    logger.info(
+                        f"Storage backend '{backend_name}' successfully initialized.")
+                    active_backends.append(backend)
+
+                except (ValueError, ImportError, ConnectionError) as e:
+                    logger.critical(
+                        f"Failed to initialize storage backend '{backend_name}': {e}. "
+                        f"This backend will be skipped.", exc_info=True)
+                except Exception as e:
+                    logger.critical(
+                        f"An unexpected error occurred during initialization of backend '{backend_name}': {e}. "
+                        f"Skipping.", exc_info=True)
+            else:
+                backend = cls._initialized_backends[backend_name_lower]
+                active_backends.append(backend)
+                logger.debug(
+                    f"Reusing already initialized storage backend: {backend_name}.")
+
+        return active_backends
+
+    @classmethod
+    def close_all_backends(cls):
+        """Closes all initialized storage backend connections/resources."""
+        logger.info("Attempting to close all initialized storage backends.")
+        for name, backend in list(cls._initialized_backends.items()):
+            try:
+                backend.close()
+                logger.info(f"Storage backend '{name}' successfully closed.")
+            except Exception as e:
+                logger.error(
+                    f"Error closing storage backend '{name}': {e}", exc_info=True)
+            finally:
+                del cls._initialized_backends[name]
+
+        # Close PostgreSQL connection pool
+        if PostgreSQLStorageBackend._connection_pool:
+            try:
+                PostgreSQLStorageBackend._connection_pool.closeall()
+                logger.info("PostgreSQL connection pool closed.")
+            except Exception as e:
+                logger.error(
+                    f"Error closing PostgreSQL connection pool: {e}", exc_info=True)
+            finally:
+                PostgreSQLStorageBackend._connection_pool = None
+
+
+atexit.register(StorageBackendFactory.close_all_backends)
+
+# src/storage/backends.py
+
+===== END: ./src//storage/backends.py =====
+
+===== FILE: ./src//utils/logger.py =====
+"""
+utils/logger.py
+
+Configures a structured, JSON-formatted logger for the application.
+"""
+
+import logging
+import logging.config
+from pythonjsonlogger.jsonlogger import JsonFormatter
+import os
+import yaml
+from src.utils.config_manager import ConfigManager
+
+
+class CustomJsonFormatter(JsonFormatter):
+    """
+    Custom JSON formatter to allow adding extra fields to log records if needed.
+    Currently a placeholder for future customization.
+    """
+
+    def add_fields(self, log_record, message_dict):
+        super(CustomJsonFormatter, self).add_fields(log_record, message_dict)
+        # Add custom fields here if needed in the future
+        # Example: log_record['service_name'] = os.getenv("SERVICE_NAME", "ingestion_service")
+
+
+def setup_logging(config_path: str = "./config/settings.yaml"):
+    """
+    Sets up structured logging based on the configuration file.
+    Ensures log directories exist and falls back to basic logging if configuration fails.
+    """
+    if not os.path.exists(config_path):
+        logging.warning(
+            f"Logging configuration file not found at {config_path}. Using default console logging."
+        )
+        logging.basicConfig(
+            level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        return
+
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+
+        log_config = config.get("logging")
+        if log_config:
+            # Ensure log directories exist for file-based handlers
+            for handler_name, handler_config in log_config.get("handlers", {}).items():
+                if 'filename' in handler_config:
+                    log_dir = os.path.dirname(handler_config['filename'])
+                    if log_dir and not os.path.exists(log_dir):
+                        os.makedirs(log_dir, exist_ok=True)
+            logging.config.dictConfig(log_config)
+            logging.info("Logging configured successfully.")
+        else:
+            logging.warning(
+                "No 'logging' section found in settings.yaml. Using default console logging."
+            )
+            logging.basicConfig(
+                level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+
+    except Exception as e:
+        logging.error(
+            f"Error setting up logging from {config_path}: {e}", exc_info=True
+        )
+        logging.basicConfig(
+            level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+
+    # Set the ingestion_service logger's level from settings
+    settings = ConfigManager.get_settings()
+    ingestion_logger = logging.getLogger("ingestion_service")
+    ingestion_logger.setLevel(settings.general.log_level)
+
+
+if __name__ == "__main__":
+    # Example usage for testing the logger configuration
+    setup_logging()
+    logger = logging.getLogger("ingestion_service")
+    logger.info("This is an info message.", extra={
+                'extra_field': 'value', 'user_id': '123'})
+    logger.warning("This is a warning message.", extra={'status_code': 404})
+    try:
+        1 / 0
+    except ZeroDivisionError:
+        logger.error("An error occurred.", exc_info=True)
+
+===== END: ./src//utils/logger.py =====
+
+===== FILE: ./src//utils/json_sanitizer.py =====
+"""
+src/utils/json_sanitizer.py
+
+Working JSON sanitization that handles unescaped quotes in strings.
+NO CLASS DEPENDENCIES - pure functions only.
+"""
+
+import json
+import re
+import logging
+from typing import Dict, Any, Optional, Tuple
+
+logger = logging.getLogger("ingestion_service")
+
+
+def sanitize_and_parse_json(json_string: str, line_number: int = 0) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Parse JSON with multiple fallback strategies.
+    
+    Args:
+        json_string: Raw JSON string to parse
+        line_number: Line number for logging
+    
+    Returns:
+        Tuple of (parsed_dict, error_message)
+        - Success: (dict, None)
+        - Failure: (None, error_message)
+    """
+    if not json_string or not json_string.strip():
+        return None, "Empty line"
+
+    original = json_string.strip()
+
+    # Strategy 1: Direct parse (works for valid JSON)
+    try:
+        result = json.loads(original)
+        return result, None
+    except json.JSONDecodeError as e:
+        first_error = f"{e.msg} at position {e.pos}"
+        error_pos = e.pos
+    except Exception as e:
+        return None, f"Unexpected error: {str(e)}"
+
+    # Strategy 2: Fix unescaped quotes in string values
+    try:
+        cleaned = _fix_unescaped_quotes(original, error_pos)
+        result = json.loads(cleaned)
+        logger.info(f"Line {line_number}: Fixed unescaped quotes")
+        return result, None
+    except Exception as e:
+        logger.debug(f"Line {line_number}: Quote fix failed: {e}")
+
+    # Strategy 3: Fix Unicode issues
+    try:
+        cleaned = _fix_unicode_issues(original)
+        result = json.loads(cleaned)
+        logger.info(f"Line {line_number}: Fixed Unicode issues")
+        return result, None
+    except Exception as e:
+        logger.debug(f"Line {line_number}: Unicode fix failed: {e}")
+
+    # Strategy 4: Combined fixes
+    try:
+        cleaned = _fix_unicode_issues(original)
+        cleaned = _fix_unescaped_quotes(cleaned, 0)
+        result = json.loads(cleaned)
+        logger.info(f"Line {line_number}: Fixed with combined strategy")
+        return result, None
+    except Exception as e:
+        logger.debug(f"Line {line_number}: Combined fix failed: {e}")
+
+    # Strategy 5: Aggressive field extraction
+    try:
+        result = _extract_fields_aggressive(original)
+        if result and 'document_id' in result and 'text' in result:
+            logger.warning(f"Line {line_number}: Used aggressive extraction")
+            return result, None
+    except Exception as e:
+        logger.debug(f"Line {line_number}: Extraction failed: {e}")
+
+    return None, f"All parsing failed. {first_error}"
+
+
+def _fix_unescaped_quotes(json_str: str, error_pos: int = 0) -> str:
+    """
+    Fix unescaped quotes inside JSON string values.
+    
+    Strategy: Parse character by character, track if we're inside a string value,
+    and escape any unescaped quotes found inside string values.
+    """
+    if not json_str:
+        return json_str
+
+    result = []
+    i = 0
+    in_string = False
+    in_field_name = False
+    after_colon = False
+    escape_next = False
+
+    while i < len(json_str):
+        char = json_str[i]
+
+        # Handle escape sequences
+        if escape_next:
+            result.append(char)
+            escape_next = False
+            i += 1
+            continue
+
+        if char == '\\':
+            result.append(char)
+            escape_next = True
+            i += 1
+            continue
+
+        # Handle quotes
+        if char == '"':
+            if not in_string:
+                # Starting a string (either field name or value)
+                in_string = True
+                if after_colon:
+                    in_field_name = False
+                else:
+                    in_field_name = True
+                result.append(char)
+            else:
+                # Potentially ending a string
+                # Look ahead to see if this is truly the end
+                next_char_idx = i + 1
+
+                # Skip whitespace
+                while next_char_idx < len(json_str) and json_str[next_char_idx] in ' \t\n\r':
+                    next_char_idx += 1
+
+                # Check what comes after
+                if next_char_idx < len(json_str):
+                    next_char = json_str[next_char_idx]
+
+                    if in_field_name and next_char == ':':
+                        # This is the end of a field name
+                        in_string = False
+                        in_field_name = False
+                        after_colon = True
+                        result.append(char)
+                    elif next_char in ',}':
+                        # This is the end of a value
+                        in_string = False
+                        after_colon = False
+                        result.append(char)
+                    else:
+                        # This quote is inside the string value - escape it!
+                        result.append('\\')
+                        result.append(char)
+                else:
+                    # End of JSON string
+                    in_string = False
+                    result.append(char)
+
+        elif char == ':' and not in_string:
+            after_colon = True
+            result.append(char)
+
+        elif char in ',{}' and not in_string:
+            after_colon = False
+            result.append(char)
+
+        else:
+            result.append(char)
+
+        i += 1
+
+    return ''.join(result)
+
+
+def _fix_unicode_issues(text: str) -> str:
+    """Fix common Unicode issues that break JSON parsing."""
+    replacements = {
+        '\u201c': '\\"',  # Left double quote → escaped quote
+        '\u201d': '\\"',  # Right double quote → escaped quote
+        '\u2018': "'",    # Left single quote
+        '\u2019': "'",    # Right single quote
+        '\u2014': '--',   # Em dash
+        '\u2013': '-',    # En dash
+        '\u2026': '...',  # Ellipsis
+        '\u00a0': ' ',    # Non-breaking space
+        '\u200b': '',     # Zero-width space
+        '\u200c': '',     # Zero-width non-joiner
+        '\u200d': '',     # Zero-width joiner
+        '\ufeff': '',     # BOM
+        '\u2028': ' ',    # Line separator
+        '\u2029': ' ',    # Paragraph separator
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    # Remove control characters except tab, newline, carriage return
+    text = ''.join(c for c in text if ord(c) >= 32 or c in '\t\n\r')
+
+    return text
+
+
+def _extract_fields_aggressive(json_string: str) -> Optional[Dict[str, Any]]:
+    """
+    Last resort: Extract fields using regex patterns.
+    Only extracts minimum required fields.
+    """
+    result = {}
+
+    # Extract document_id
+    doc_match = re.search(r'"document_id"\s*:\s*"([^"]+)"', json_string)
+    if not doc_match:
+        return None
+    result['document_id'] = doc_match.group(1)
+
+    # Extract text - this is tricky with embedded quotes
+    # Find "text":"
+    text_start_match = re.search(r'"text"\s*:\s*"', json_string)
+    if text_start_match:
+        start = text_start_match.end()
+
+        # Find the end by looking for ","field" pattern or "}
+        pos = start
+        text_chars = []
+
+        while pos < len(json_string):
+            char = json_string[pos]
+
+            if char == '\\' and pos + 1 < len(json_string):
+                # Skip escape sequence
+                text_chars.append(char)
+                text_chars.append(json_string[pos + 1])
+                pos += 2
+                continue
+
+            if char == '"':
+                # Check if this ends the text field
+                check_pos = pos + 1
+                while check_pos < len(json_string) and json_string[check_pos] in ' \t\n\r':
+                    check_pos += 1
+
+                if check_pos < len(json_string) and json_string[check_pos] in ',}':
+                    # Found the end!
+                    break
+                else:
+                    # Quote inside the text
+                    text_chars.append(char)
+            else:
+                text_chars.append(char)
+
+            pos += 1
+
+        result['text'] = ''.join(text_chars)
+
+    if 'text' not in result:
+        return None
+
+    # Extract optional fields with simple regex
+    for field in ['title', 'excerpt', 'author', 'source_url', 'publication_date']:
+        match = re.search(f'"{field}"\\s*:\\s*"([^"]*)"', json_string)
+        if match:
+            result[field] = match.group(1)
+
+    return result
+
+
+# Test function for development
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+
+    # Test with problematic line
+    test = '{"document_id":"test","text":"He said "hello" to me"}'
+    result, error = sanitize_and_parse_json(test, 1)
+
+    if result:
+        print(f"✅ SUCCESS: {result}")
+    else:
+        print(f"❌ FAILED: {error}")
+
+# src/utils/json_sanitizer.py
+
+===== END: ./src//utils/json_sanitizer.py =====
+
+===== FILE: ./src//utils/text_cleaners.py =====
+"""
+src/utils/text_cleaners.py
+
+Utility module for text cleaning operations.
+Provides modular, configurable text cleaning functions with proper separation of concerns.
+
+Each cleaning function can be enabled/disabled via configuration.
+"""
+
+import re
+import string
+import ftfy
+import logging
+from typing import List, Set, Optional
+from spellchecker import SpellChecker
+
+logger = logging.getLogger("ingestion_service")
+
+
+class TextCleanerConfig:
+    """Configuration object for text cleaning operations."""
+
+    def __init__(self, config_dict: dict):
+        """
+        Initialize cleaner config from settings dictionary.
+        
+        Args:
+            config_dict: Dictionary from settings.ingestion_service.cleaning_pipeline
+        """
+        self.remove_html_tags = config_dict.get('remove_html_tags', True)
+        self.normalize_whitespace = config_dict.get(
+            'normalize_whitespace', True)
+        self.fix_encoding = config_dict.get('fix_encoding', True)
+        self.normalize_punctuation = config_dict.get(
+            'normalize_punctuation', True)
+        self.normalize_unicode_dashes = config_dict.get(
+            'normalize_unicode_dashes', True)
+        self.normalize_smart_quotes = config_dict.get(
+            'normalize_smart_quotes', True)
+        self.remove_excessive_punctuation = config_dict.get(
+            'remove_excessive_punctuation', True)
+        self.add_space_after_punctuation = config_dict.get(
+            'add_space_after_punctuation', True)
+        self.standardize_units = config_dict.get('standardize_units', True)
+        self.standardize_currency = config_dict.get(
+            'standardize_currency', True)
+        self.enable_typo_correction = config_dict.get(
+            'enable_typo_correction', True)
+
+        # Typo correction sub-config
+        typo_config = config_dict.get('typo_correction', {})
+        self.typo_min_length = typo_config.get('min_word_length', 3)
+        self.typo_max_length = typo_config.get('max_word_length', 15)
+        self.typo_skip_capitalized = typo_config.get(
+            'skip_capitalized_words', True)
+        self.typo_skip_mixed_case = typo_config.get('skip_mixed_case', True)
+        self.typo_use_ner = typo_config.get('use_ner_entities', True)
+        self.typo_confidence = typo_config.get('confidence_threshold', 0.7)
+
+
+# Pre-compiled regex patterns for performance
+class RegexPatterns:
+    """Pre-compiled regex patterns for text cleaning."""
+
+    HTML_TAGS = re.compile(r'<.*?>', re.DOTALL)
+    WHITESPACE = re.compile(r'\s+', re.MULTILINE)
+    UNICODE_DASHES = re.compile(r'[\u2010-\u2015\u2212]')
+    SMART_QUOTES_DOUBLE = re.compile(r'[\u201c\u201d]')
+    SMART_QUOTES_SINGLE = re.compile(r'[\u2018\u2019]')
+    ELLIPSIS = re.compile(r'\.{2,}')
+    REPEATED_COMMAS = re.compile(r',{2,}')
+    REPEATED_EXCLAMATION = re.compile(r'!{2,}')
+    REPEATED_QUESTION = re.compile(r'\?{2,}')
+    REPEATED_DASHES = re.compile(r'-{2,}')
+    PUNCTUATION_SPACING = re.compile(r'([.,?!])(?=[a-zA-Z0-9])')
+
+    # Currency patterns
+    CURRENCY_USD = re.compile(r'\$\s*(\d+(?:\.\d{1,2})?)')
+    CURRENCY_EUR = re.compile(r'(\d+)\s*€')
+    CURRENCY_GBP = re.compile(r'£\s*(\d+(?:\.\d{1,2})?)')
+    CURRENCY_WORD_USD = re.compile(r'\b(?:usd|us dollars?)\b', re.IGNORECASE)
+    CURRENCY_WORD_EUR = re.compile(r'\b(?:eur|euros?)\b', re.IGNORECASE)
+    CURRENCY_WORD_GBP = re.compile(
+        r'\b(?:gbp|pounds?sterling)\b', re.IGNORECASE)
+
+    # Unit patterns
+    UNIT_PERCENT = re.compile(r'(\d+(?:\.\d+)?)\s*%')
+    UNIT_METERS = re.compile(r'(\d+)\s*m\b')
+    UNIT_KM = re.compile(r'(\d+)\s*km\b')
+    UNIT_KG = re.compile(r'(\d+)\s*kg\b')
+    UNIT_CM = re.compile(r'(\d+)\s*cm\b')
+    UNIT_FEET = re.compile(r'(\d+)\s*ft\b')
+    UNIT_POUNDS = re.compile(r'(\d+)\s*lbs\b')
+    UNIT_MILES = re.compile(r'(\d+)\s*mi\b')
+    UNIT_GRAMS = re.compile(r'(\d+)\s*g\b')
+
+
+def remove_html_tags(text: str) -> str:
+    """
+    Remove HTML tags from text.
+    
+    Args:
+        text: Input text with potential HTML tags
+        
+    Returns:
+        Text with HTML tags removed
+    """
+    return RegexPatterns.HTML_TAGS.sub(' ', text)
+
+
+def normalize_whitespace(text: str) -> str:
+    """
+    Normalize whitespace by collapsing multiple spaces/tabs/newlines into single spaces.
+    
+    Args:
+        text: Input text with irregular whitespace
+        
+    Returns:
+        Text with normalized whitespace
+    """
+    return RegexPatterns.WHITESPACE.sub(' ', text).strip()
+
+
+def fix_encoding(text: str) -> str:
+    """
+    Fix common encoding issues using ftfy library.
+    Handles mojibake and mixed encodings.
+    
+    Args:
+        text: Text with potential encoding issues
+        
+    Returns:
+        Text with fixed encoding
+    """
+    return ftfy.fix_text(text)
+
+
+def normalize_unicode_dashes(text: str) -> str:
+    """
+    Convert unicode dashes to ASCII hyphens.
+    
+    Args:
+        text: Text with unicode dashes
+        
+    Returns:
+        Text with ASCII hyphens
+    """
+    return RegexPatterns.UNICODE_DASHES.sub('-', text)
+
+
+def normalize_smart_quotes(text: str) -> str:
+    """
+    Convert smart/curly quotes to straight quotes.
+    
+    Args:
+        text: Text with smart quotes
+        
+    Returns:
+        Text with straight quotes
+    """
+    text = RegexPatterns.SMART_QUOTES_DOUBLE.sub('"', text)
+    text = RegexPatterns.SMART_QUOTES_SINGLE.sub("'", text)
+    return text
+
+
+def remove_non_printable(text: str) -> str:
+    """
+    Remove non-printable characters from text.
+    
+    Args:
+        text: Text with potential non-printable characters
+        
+    Returns:
+        Text with only printable characters
+    """
+    printable = set(string.printable)
+    return ''.join(filter(lambda x: x in printable, text))
+
+
+def remove_excessive_punctuation(text: str) -> str:
+    """
+    Remove repeated punctuation marks (!!!!, ????, etc).
+    
+    Args:
+        text: Text with excessive punctuation
+        
+    Returns:
+        Text with normalized punctuation
+    """
+    text = RegexPatterns.ELLIPSIS.sub('.', text)
+    text = RegexPatterns.REPEATED_COMMAS.sub(',', text)
+    text = RegexPatterns.REPEATED_EXCLAMATION.sub('!', text)
+    text = RegexPatterns.REPEATED_QUESTION.sub('?', text)
+    text = RegexPatterns.REPEATED_DASHES.sub('-', text)
+    return text
+
+
+def add_space_after_punctuation(text: str) -> str:
+    """
+    Ensure space after punctuation marks.
+    
+    Args:
+        text: Text potentially missing spaces after punctuation
+        
+    Returns:
+        Text with proper spacing after punctuation
+    """
+    return RegexPatterns.PUNCTUATION_SPACING.sub(r'\1 ', text)
+
+
+def standardize_currency(text: str) -> str:
+    """
+    Standardize currency representations.
+    
+    Examples:
+        $100 -> USD 100
+        €50 -> 50 EUR
+        £20 -> GBP 20
+    
+    Args:
+        text: Text with various currency formats
+        
+    Returns:
+        Text with standardized currency
+    """
+    text = RegexPatterns.CURRENCY_USD.sub(r'USD \1', text)
+    text = RegexPatterns.CURRENCY_EUR.sub(r'\1 EUR', text)
+    text = RegexPatterns.CURRENCY_GBP.sub(r'GBP \1', text)
+    text = RegexPatterns.CURRENCY_WORD_USD.sub('USD', text)
+    text = RegexPatterns.CURRENCY_WORD_EUR.sub('EUR', text)
+    text = RegexPatterns.CURRENCY_WORD_GBP.sub('GBP', text)
+    return text
+
+
+def standardize_units(text: str) -> str:
+    """
+    Standardize unit representations.
+    
+    Examples:
+        5m -> 5 meters
+        10kg -> 10 kilograms
+        3% -> 3 percent
+    
+    Args:
+        text: Text with various unit formats
+        
+    Returns:
+        Text with standardized units
+    """
+    text = RegexPatterns.UNIT_PERCENT.sub(r'\1 percent', text)
+    text = RegexPatterns.UNIT_METERS.sub(r'\1 meters', text)
+    text = RegexPatterns.UNIT_KM.sub(r'\1 kilometers', text)
+    text = RegexPatterns.UNIT_KG.sub(r'\1 kilograms', text)
+    text = RegexPatterns.UNIT_CM.sub(r'\1 centimeters', text)
+    text = RegexPatterns.UNIT_FEET.sub(r'\1 feet', text)
+    text = RegexPatterns.UNIT_POUNDS.sub(r'\1 pounds', text)
+    text = RegexPatterns.UNIT_MILES.sub(r'\1 miles', text)
+    text = RegexPatterns.UNIT_GRAMS.sub(r'\1 grams', text)
+    return text
+
+
+def correct_typos(
+    text: str,
+    config: TextCleanerConfig,
+    ner_entities: Optional[Set[str]] = None,
+    spell_checker: Optional[SpellChecker] = None
+) -> str:
+    """
+    Correct typographical errors using PySpellChecker.
+    
+    CRITICAL: Uses NER entities to avoid correcting proper nouns like "San Francisco".
+    
+    Args:
+        text: Text to check for typos
+        config: Cleaning configuration with typo settings
+        ner_entities: Set of entity words from spaCy NER (prevents correcting proper nouns)
+        spell_checker: Optional pre-initialized spell checker (for performance)
+        
+    Returns:
+        Text with typos corrected
+    """
+    if not config.enable_typo_correction:
+        return text
+
+    if spell_checker is None:
+        spell_checker = SpellChecker()
+
+    # Extract NER entity words for lookup
+    entity_words = set()
+    if ner_entities and config.typo_use_ner:
+        for entity_text in ner_entities:
+            # Split multi-word entities (e.g., "San Francisco" -> {"San", "Francisco"})
+            entity_words.update(word.lower() for word in entity_text.split())
+
+    words = text.split()
+    corrected_words = []
+
+    for word in words:
+        # Skip non-alphabetic words
+        if not word.isalpha():
+            corrected_words.append(word)
+            continue
+
+        # Skip words outside length range
+        if len(word) < config.typo_min_length or len(word) > config.typo_max_length:
+            corrected_words.append(word)
+            continue
+
+        # CRITICAL: Skip if word is part of a recognized entity
+        if config.typo_use_ner and word.lower() in entity_words:
+            corrected_words.append(word)
+            logger.debug(f"Skipping '{word}' - recognized as NER entity")
+            continue
+
+        # Skip capitalized words (proper nouns)
+        if config.typo_skip_capitalized and word[0].isupper() and len(word) > 5:
+            corrected_words.append(word)
+            continue
+
+        # Skip mixed-case words (e.g., "iPhone", "McDonald's")
+        if config.typo_skip_mixed_case and word[0].isupper() and any(c.isupper() for c in word[1:]):
+            corrected_words.append(word)
+            continue
+
+        # Check if word is misspelled
+        word_lower = word.lower()
+        correction = spell_checker.correction(word_lower)
+
+        if correction and correction != word_lower:
+            # Only apply if length difference is small (high confidence)
+            length_diff = abs(len(correction) - len(word_lower))
+            if length_diff <= (1.0 - config.typo_confidence) * 10:  # Scale threshold
+                # Preserve original capitalization
+                if word[0].isupper():
+                    correction = correction.capitalize()
+                corrected_words.append(correction)
+                logger.debug(f"Corrected typo: '{word}' -> '{correction}'")
+            else:
+                corrected_words.append(word)
+        else:
+            corrected_words.append(word)
+
+    return ' '.join(corrected_words)
+
+
+def clean_text_pipeline(
+    text: str,
+    config: TextCleanerConfig,
+    ner_entities: Optional[Set[str]] = None,
+    spell_checker: Optional[SpellChecker] = None
+) -> str:
+    """
+    Execute the full text cleaning pipeline based on configuration.
+    
+    Args:
+        text: Raw input text
+        config: Cleaning configuration
+        ner_entities: Optional set of NER entity texts to protect from typo correction
+        spell_checker: Optional pre-initialized spell checker
+        
+    Returns:
+        Cleaned text
+    """
+    logger.debug("Starting text cleaning pipeline")
+
+    # Step 1: HTML removal
+    if config.remove_html_tags:
+        text = remove_html_tags(text)
+        logger.debug("HTML tags removed")
+
+    # Step 2: Initial whitespace normalization
+    if config.normalize_whitespace:
+        text = normalize_whitespace(text)
+        logger.debug("Whitespace normalized")
+
+    # Step 3: Encoding fixes
+    if config.fix_encoding:
+        text = fix_encoding(text)
+        logger.debug("Encoding fixed")
+
+    # Step 4: Currency standardization
+    if config.standardize_currency:
+        text = standardize_currency(text)
+        logger.debug("Currency standardized")
+
+    # Step 5: Unit standardization
+    if config.standardize_units:
+        text = standardize_units(text)
+        logger.debug("Units standardized")
+
+    # Step 6: Punctuation normalization
+    if config.normalize_punctuation:
+        if config.normalize_unicode_dashes:
+            text = normalize_unicode_dashes(text)
+        if config.normalize_smart_quotes:
+            text = normalize_smart_quotes(text)
+        text = remove_non_printable(text)
+        logger.debug("Punctuation normalized")
+
+    # Step 7: Excessive punctuation removal
+    if config.remove_excessive_punctuation:
+        text = remove_excessive_punctuation(text)
+        logger.debug("Excessive punctuation removed")
+
+    # Step 8: Space after punctuation
+    if config.add_space_after_punctuation:
+        text = add_space_after_punctuation(text)
+        logger.debug("Spacing after punctuation ensured")
+
+    # Step 9: Typo correction (uses NER entities if provided)
+    if config.enable_typo_correction:
+        text = correct_typos(text, config, ner_entities, spell_checker)
+        logger.debug("Typo correction completed")
+
+    # Step 10: Final whitespace normalization
+    if config.normalize_whitespace:
+        text = normalize_whitespace(text)
+        logger.debug("Final whitespace normalized")
+
+    logger.debug("Text cleaning pipeline completed")
+    return text
+
+
+# src/utils/text_cleaners.py
+
+===== END: ./src//utils/text_cleaners.py =====
+
+===== FILE: ./src//utils/config_manager.py =====
+# src/utils/config_manager.py
+"""
+utils/config_manager.py
+
+Handles loading application settings from a YAML configuration file
+using Pydantic for validation and type-hinting.
+"""
+
+from typing import Optional, Dict, Any, List
+from pydantic import BaseModel, Field, HttpUrl
+from pydantic_settings import BaseSettings, SettingsConfigDict
+import yaml
+import os
+import sys
+
+
+class GeneralSettings(BaseModel):
+    """General application settings."""
+    log_level: str = Field(
+        "INFO", description="Set to INFO for production readiness, DEBUG for development.")
+    gpu_enabled: bool = Field(
+        False, description="Set to True to leverage GPU (e.g., RTX A4000).")
+
+
+class TypoCorrectionSettings(BaseModel):
+    """Settings for typo correction behavior."""
+    min_word_length: int = Field(
+        3, description="Minimum word length to check for typos.")
+    max_word_length: int = Field(
+        15, description="Maximum word length to check (longer words likely proper nouns).")
+    skip_capitalized_words: bool = Field(
+        True, description="Skip words that start with a capital letter.")
+    skip_mixed_case: bool = Field(
+        True, description="Skip words with mixed case like 'iPhone'.")
+    use_ner_entities: bool = Field(
+        True, description="Use NER to skip entity words (CRITICAL for proper nouns).")
+    confidence_threshold: float = Field(
+        0.7, description="Spell checker confidence threshold (0.0-1.0).")
+
+
+class CleaningPipelineSettings(BaseModel):
+    """Settings for text cleaning pipeline steps."""
+    remove_html_tags: bool = Field(True, description="Remove HTML tags.")
+    normalize_whitespace: bool = Field(True, description="Normalize whitespace.")
+    fix_encoding: bool = Field(True, description="Fix encoding issues with ftfy.")
+    normalize_punctuation: bool = Field(True, description="Normalize punctuation.")
+    normalize_unicode_dashes: bool = Field(True, description="Convert unicode dashes to ASCII.")
+    normalize_smart_quotes: bool = Field(True, description="Convert smart quotes to straight quotes.")
+    remove_excessive_punctuation: bool = Field(True, description="Remove repeated punctuation.")
+    add_space_after_punctuation: bool = Field(True, description="Ensure space after punctuation.")
+    standardize_units: bool = Field(True, description="Standardize unit representations.")
+    standardize_currency: bool = Field(True, description="Standardize currency representations.")
+    enable_typo_correction: bool = Field(True, description="Enable typo correction.")
+    typo_correction: TypoCorrectionSettings = Field(
+        default_factory=TypoCorrectionSettings,
+        description="Typo correction specific settings.")
+
+
+class EntityRecognitionSettings(BaseModel):
+    """Settings for named entity recognition."""
+    enabled: bool = Field(True, description="Enable entity recognition.")
+    entity_types_to_extract: List[str] = Field(
+        ["PERSON", "ORG", "GPE", "LOC", "DATE", "TIME", "MONEY", "PERCENT"],
+        description="Entity types to extract from text.")
+
+
+class IngestionServiceSettings(BaseModel):
+    """Settings for the Ingestion Microservice."""
+    port: int = Field(8000, description="Port for the Ingestion service API.")
+    model_name: str = Field(
+        "en_core_web_trf", description="The spaCy model to use for NER.")
+    model_cache_dir: str = Field(
+        "/app/.cache/spacy", description="Path for spaCy to cache models.")
+    dateparser_languages: List[str] = Field(
+        ["en"], description="Languages for dateparser to consider.")
+    batch_processing_threads: int = Field(
+        4, description="Number of threads for CLI batch processing.")
+    langdetect_confidence_threshold: float = Field(
+        0.9, description="Minimum confidence for language detection.")
+    
+    # New nested settings
+    cleaning_pipeline: CleaningPipelineSettings = Field(
+        default_factory=CleaningPipelineSettings,
+        description="Text cleaning pipeline configuration.")
+    entity_recognition: EntityRecognitionSettings = Field(
+        default_factory=EntityRecognitionSettings,
+        description="Entity recognition configuration.")
+
+    model_config = SettingsConfigDict(
+        arbitrary_types_allowed=True,
+        protected_namespaces=()
+    )
+
+
+class CelerySettings(BaseModel):
+    """Settings for Celery task queue."""
+    broker_url: str = Field("redis://redis:6379/0",
+                            description="Redis as broker URL.")
+    result_backend: str = Field(
+        "redis://redis:6379/0", description="Redis as result backend URL.")
+    task_acks_late: bool = Field(
+        True, description="Acknowledge task only after it's done.")
+    worker_prefetch_multiplier: int = Field(
+        1, description="Only fetch one task at a time per worker process.")
+    worker_concurrency: int = Field(
+        4, description="Number of worker processes. Adjust based on CPU cores.")
+    task_annotations: Dict[str, Dict[str, Any]] = Field(
+        {'*': {'rate_limit': '300/m'}}, description="Task-specific annotations for Celery.")
+
+    model_config = SettingsConfigDict(
+        arbitrary_types_allowed=True,
+        protected_namespaces=()
+    )
+
+
+class JsonlStorageConfig(BaseModel):
+    """Configuration for JSONL file storage."""
+    output_path: str = Field("/app/data/processed_articles.jsonl",
+                             description="Default output path for JSONL.")
+
+
+class ElasticsearchStorageConfig(BaseModel):
+    """Configuration for Elasticsearch storage."""
+    host: str = Field(
+        "elasticsearch", description="Elasticsearch host (Docker service name or IP).")
+    port: int = Field(9200, description="Elasticsearch port.")
+    scheme: str = Field(
+        "http", description="Connection scheme (http or https).")
+    index_name: str = Field(
+        "news_articles", description="Name of the Elasticsearch index.")
+    api_key: Optional[str] = Field(
+        None, description="Elasticsearch API key for authentication.")
+
+
+class PostgreSQLStorageConfig(BaseModel):
+    """Configuration for PostgreSQL storage."""
+    host: str = Field(
+        "postgres", description="PostgreSQL host (Docker service name or IP).")
+    port: int = Field(5432, description="PostgreSQL port.")
+    dbname: str = Field("newsdb", description="PostgreSQL database name.")
+    user: str = Field("user", description="PostgreSQL username.")
+    password: str = Field("password", description="PostgreSQL password.")
+    table_name: str = Field("processed_articles",
+                            description="Table name for storing articles.")
+
+
+class StorageSettings(BaseModel):
+    """Overall settings for data storage backends."""
+    enabled_backends: List[str] = Field(
+        ["jsonl"], description="List of storage backend names.")
+    jsonl: Optional[JsonlStorageConfig] = Field(
+        None, description="JSONL storage specific configuration.")
+    elasticsearch: Optional[ElasticsearchStorageConfig] = Field(
+        None, description="Elasticsearch storage specific configuration.")
+    postgresql: Optional[PostgreSQLStorageConfig] = Field(
+        None, description="PostgreSQL storage specific configuration.")
+
+    model_config = SettingsConfigDict(
+        arbitrary_types_allowed=True,
+        protected_namespaces=()
+    )
+
+
+class FormatterConfig(BaseModel):
+    """Logging formatter configuration."""
+    class_: str = Field(..., alias="class",
+                        description="The class path for the formatter.")
+    format: str = Field(..., description="The log format string.")
+
+    model_config = SettingsConfigDict(
+        extra='allow',
+        arbitrary_types_allowed=True,
+        protected_namespaces=()
+    )
+
+
+class HandlerConfig(BaseModel):
+    """Logging handler configuration."""
+    class_: str = Field(..., alias="class",
+                        description="The class path for the handler.")
+    formatter: Optional[str] = Field(
+        None, description="The formatter name to use for this handler.")
+    stream: Optional[str] = Field(
+        None, description="The stream for StreamHandler.")
+    filename: Optional[str] = Field(
+        None, description="The log file path for file-based handlers.")
+    maxBytes: Optional[int] = Field(
+        None, description="Maximum file size for RotatingFileHandler.")
+    backupCount: Optional[int] = Field(
+        None, description="Number of backup files for RotatingFileHandler.")
+
+    model_config = SettingsConfigDict(
+        extra='allow',
+        arbitrary_types_allowed=True,
+        protected_namespaces=()
+    )
+
+
+class LoggingConfig(BaseModel):
+    """Logging configuration."""
+    version: int
+    disable_existing_loggers: bool
+    formatters: Dict[str, FormatterConfig]
+    handlers: Dict[str, HandlerConfig]
+    root: Dict[str, Any]
+    loggers: Dict[str, Dict[str, Any]]
+
+    model_config = SettingsConfigDict(
+        arbitrary_types_allowed=True,
+        protected_namespaces=()
+    )
+
+
+class Settings(BaseSettings):
+    """Main settings model, loaded from a YAML file."""
+    general: GeneralSettings
+    ingestion_service: IngestionServiceSettings
+    celery: CelerySettings
+    storage: StorageSettings
+    logging: LoggingConfig
+
+    model_config = SettingsConfigDict(
+        protected_namespaces=()
+    )
+
+
+class ConfigManager:
+    """
+    Singleton class to manage and load application settings.
+    """
+    _settings: Optional[Settings] = None
+
+    @staticmethod
+    def get_settings() -> Settings:
+        """
+        Loads and returns the application settings. This is a singleton
+        method that ensures the config is loaded only once.
+        """
+        if ConfigManager._settings is None:
+            config_path = os.path.join(os.path.dirname(
+                __file__), '../../config/settings.yaml')
+            if not os.path.exists(config_path):
+                raise FileNotFoundError(
+                    f"Configuration file not found at {config_path}")
+
+            with open(config_path, 'r') as f:
+                config_data = yaml.safe_load(f)
+
+            try:
+                ConfigManager._settings = Settings.model_validate(config_data)
+            except Exception as e:
+                print(f"CRITICAL ERROR: Failed to validate settings from {config_path}. "
+                      f"Please check your settings.yaml file against the schema. Error: {e}", file=sys.stderr)
+                raise RuntimeError(
+                    "Failed to load and validate application settings.") from e
+
+        return ConfigManager._settings
+
+
+if __name__ == '__main__':
+    try:
+        settings = ConfigManager.get_settings()
+        print("--- Loaded Settings ---")
+        print(f"Log Level: {settings.general.log_level}")
+        print(f"GPU Enabled: {settings.general.gpu_enabled}")
+        print(f"Typo Correction: {settings.ingestion_service.cleaning_pipeline.enable_typo_correction}")
+        print(f"Use NER for Typos: {settings.ingestion_service.cleaning_pipeline.typo_correction.use_ner_entities}")
+    except Exception as e:
+        print(f"Test failed: {e}", file=sys.stderr)
+
+
+# src/utils/config_manager.py
+
+===== END: ./src//utils/config_manager.py =====
+
+===== FILE: ./src//celery_app.py =====
+"""
+src/celery_app.py
+
+Defines the Celery application and tasks for asynchronous processing.
+
+FIXES APPLIED:
+- Fix #8: Enhanced retry logic with exponential backoff and jitter
+- FIXED: Added custom_cleaning_config parameter support
+"""
+
+import json
+import logging
+from celery import Celery
+from celery import signals
+from src.core.processor import TextPreprocessor
+from src.schemas.data_models import ArticleInput, PreprocessSingleResponse
+from src.utils.config_manager import ConfigManager
+from src.storage.backends import StorageBackendFactory
+from typing import Dict, Any, Optional
+
+settings = ConfigManager.get_settings()
+logger = logging.getLogger("ingestion_service")
+
+# Initialize the Celery app with a specific name and broker/backend from settings.
+celery_app = Celery(
+    "ingestion_service",
+    broker=settings.celery.broker_url,
+    backend=settings.celery.result_backend
+)
+
+# Apply Celery configurations from settings.
+celery_app.conf.update(
+    task_acks_late=settings.celery.task_acks_late,
+    worker_prefetch_multiplier=settings.celery.worker_prefetch_multiplier,
+    worker_concurrency=settings.celery.worker_concurrency,
+    task_annotations=settings.celery.task_annotations,
+    # Additional configurations for better reliability
+    task_reject_on_worker_lost=True,
+    task_acks_on_failure_or_timeout=True,
+    broker_connection_retry_on_startup=True,
+)
+
+# A global variable to hold the TextPreprocessor instance per worker process.
+# It will be set by the signal handler below.
+preprocessor = None
+
+
+@signals.worker_process_init.connect
+def initialize_preprocessor(**kwargs):
+    """
+    This signal handler runs when each Celery worker process is initialized.
+    It's the perfect place to load the heavy spaCy model to ensure a clean
+    GPU context for each worker.
+    """
+    global preprocessor
+    logger.info(
+        "Celery worker process initializing. Loading TextPreprocessor instance.")
+    preprocessor = TextPreprocessor()
+    logger.info(
+        "TextPreprocessor initialized successfully in Celery worker.")
+
+
+@signals.worker_process_shutdown.connect
+def cleanup_preprocessor(**kwargs):
+    """
+    Signal handler for worker process shutdown.
+    Properly closes TextPreprocessor resources.
+    """
+    global preprocessor
+    if preprocessor:
+        logger.info(
+            "Celery worker shutting down. Cleaning up TextPreprocessor.")
+        preprocessor.close()
+        preprocessor = None
+
+
+@celery_app.task(
+    name="preprocess_article",
+    bind=True,
+    max_retries=3,
+    default_retry_delay=60,  # 1 minute initial delay
+    autoretry_for=(Exception,),  # Retry on any exception
+    retry_backoff=True,  # Enable exponential backoff
+    retry_backoff_max=600,  # Max 10 minutes between retries
+    retry_jitter=True,  # Add randomness to prevent thundering herd
+    acks_late=True,  # Acknowledge task only after completion
+    reject_on_worker_lost=True  # Reject task if worker dies
+)
+def preprocess_article_task(
+    self,
+    article_data_json: str,
+    custom_cleaning_config_json: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Celery task to preprocess a single article.
+    It receives the article data as a JSON string to ensure proper serialization.
+    Optionally accepts custom cleaning configuration as JSON string.
+    
+    Args:
+        article_data_json: JSON string of article data
+        custom_cleaning_config_json: Optional JSON string of custom cleaning config
+        
+    Returns:
+        Dictionary with processed article data
+    
+    IMPROVEMENTS:
+    - Fix #8: Exponential backoff with jitter for retries
+    - Better error handling and logging
+    - Automatic retry on transient failures
+    - Support for custom cleaning configuration
+    """
+    global preprocessor
+    if preprocessor is None:
+        # This is a fallback in case the signal handler failed, though it
+        # should not be needed with the worker_process_init signal.
+        logger.warning(
+            "Preprocessor not initialized in worker_process_init. Initializing within task.")
+        preprocessor = TextPreprocessor()
+
+    document_id = "unknown"  # Default for logging in case of early failure
+    try:
+        # Parse custom cleaning config if provided
+        custom_cleaning_config = None
+        if custom_cleaning_config_json:
+            try:
+                custom_cleaning_config = json.loads(
+                    custom_cleaning_config_json)
+                logger.debug(
+                    f"Using custom cleaning config: {custom_cleaning_config}",
+                    extra={"task_id": self.request.id}
+                )
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    f"Failed to parse custom_cleaning_config_json: {e}. Using default config.",
+                    extra={"task_id": self.request.id}
+                )
+
+        # Pydantic's model_validate_json deserializes the JSON string back into a Pydantic model.
+        article_input = ArticleInput.model_validate_json(article_data_json)
+        document_id = article_input.document_id  # Update document_id for logging
+
+        logger.info(
+            f"Celery task {self.request.id} processing document_id={document_id}.",
+            extra={
+                "document_id": document_id,
+                "task_id": self.request.id,
+                "retry_count": self.request.retries
+            }
+        )
+
+        processed_data = preprocessor.preprocess(
+            document_id=article_input.document_id,
+            text=article_input.text,
+            title=article_input.title,
+            excerpt=article_input.excerpt,
+            author=article_input.author,
+            publication_date=article_input.publication_date,
+            revision_date=article_input.revision_date,
+            source_url=article_input.source_url,
+            categories=article_input.categories,
+            tags=article_input.tags,
+            media_asset_urls=article_input.media_asset_urls,
+            geographical_data=article_input.geographical_data,
+            embargo_date=article_input.embargo_date,
+            sentiment=article_input.sentiment,
+            word_count=article_input.word_count,
+            publisher=article_input.publisher,
+            additional_metadata=article_input.additional_metadata,
+            custom_cleaning_config=custom_cleaning_config  # Pass custom config
+        )
+
+        response = PreprocessSingleResponse(
+            document_id=document_id,
+            version="1.0",
+            original_text=processed_data.get("original_text", ""),
+            cleaned_text=processed_data.get("cleaned_text", ""),
+            cleaned_title=processed_data.get("cleaned_title"),
+            cleaned_excerpt=processed_data.get("cleaned_excerpt"),
+            cleaned_author=processed_data.get("cleaned_author"),
+            cleaned_publication_date=processed_data.get(
+                "cleaned_publication_date"),
+            cleaned_revision_date=processed_data.get("cleaned_revision_date"),
+            cleaned_source_url=processed_data.get("cleaned_source_url"),
+            cleaned_categories=processed_data.get("cleaned_categories"),
+            cleaned_tags=processed_data.get("cleaned_tags"),
+            cleaned_media_asset_urls=processed_data.get(
+                "cleaned_media_asset_urls"),
+            cleaned_geographical_data=processed_data.get(
+                "cleaned_geographical_data"),
+            cleaned_embargo_date=processed_data.get("cleaned_embargo_date"),
+            cleaned_sentiment=processed_data.get("cleaned_sentiment"),
+            cleaned_word_count=processed_data.get("cleaned_word_count"),
+            cleaned_publisher=processed_data.get("cleaned_publisher"),
+            temporal_metadata=processed_data.get("temporal_metadata"),
+            entities=processed_data.get("entities", []),
+            cleaned_additional_metadata=processed_data.get(
+                "cleaned_additional_metadata")
+        )
+
+        # Persist to storage backends (use default backends for Celery tasks)
+        try:
+            backends = StorageBackendFactory.get_backends()
+            for backend in backends:
+                backend.save(response)
+        except Exception as storage_error:
+            # Log storage error but don't fail the entire task
+            logger.error(
+                f"Failed to persist document_id={document_id} to storage backends: {storage_error}",
+                exc_info=True,
+                extra={
+                    "document_id": document_id,
+                    "task_id": self.request.id
+                }
+            )
+            # Optionally, you can decide whether to retry on storage failures
+            # For now, we log and continue
+
+        logger.info(
+            f"Celery task {self.request.id} successfully processed document_id={document_id}.",
+            extra={
+                "document_id": document_id,
+                "task_id": self.request.id
+            }
+        )
+
+        # Ensure the result is a dictionary with no Pydantic Url objects,
+        # as Celery's serializer cannot handle them.
+        response_dict = response.model_dump()
+        if response_dict.get('cleaned_source_url') is not None:
+            response_dict['cleaned_source_url'] = str(
+                response_dict['cleaned_source_url'])
+        if response_dict.get('cleaned_media_asset_urls') is not None:
+            response_dict['cleaned_media_asset_urls'] = [
+                str(url) for url in response_dict['cleaned_media_asset_urls']]
+
+        return response_dict
+
+    except Exception as e:
+        logger.error(
+            f"Celery task {self.request.id} failed for document_id={document_id}: {e}",
+            exc_info=True,
+            extra={
+                "document_id": document_id,
+                "task_id": self.request.id,
+                "retry_count": self.request.retries
+            }
+        )
+
+        # Check if we should retry
+        if self.request.retries < self.max_retries:
+            logger.info(
+                f"Retrying task {self.request.id} for document_id={document_id} "
+                f"(attempt {self.request.retries + 1}/{self.max_retries})",
+                extra={
+                    "document_id": document_id,
+                    "task_id": self.request.id
+                }
+            )
+
+        # Reraise the exception for Celery to handle retry logic
+        raise
+
+# src/celery_app.py
+
+===== END: ./src//celery_app.py =====
+
+===== FILE: ./src//main.py =====
+"""
+main.py
+
+Contains the core CLI logic for batch file processing using argparse.
+This file defines the `preprocess_file` function and helper logic,
+which will be called by `src/main_cli.py`.
+It now includes an option to submit batch jobs to Celery.
+
+ENHANCED:
+- Resilient error handling - continues on validation errors
+- Comprehensive error reporting at end
+- Statistics on success/failure rates
+- Detailed error summary with line numbers
+"""
+
+import logging
+import json
+import sys
+from typing import Optional, List, Dict, Any, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+from pathlib import Path
+from pydantic import ValidationError
+from datetime import date
+import argparse
+
+from src.core.processor import TextPreprocessor
+from src.schemas.data_models import ArticleInput, PreprocessFileResult, PreprocessSingleResponse
+from src.utils.config_manager import ConfigManager
+from src.utils.logger import setup_logging
+from src.storage.backends import StorageBackendFactory
+from src.utils.json_sanitizer import sanitize_and_parse_json  # NEW
+
+# Import Celery task
+from src.celery_app import preprocess_article_task
+
+# Load settings and configure logging once on startup.
+settings = ConfigManager.get_settings()
+setup_logging()
+logger = logging.getLogger("ingestion_service")
+
+# Instantiate TextPreprocessor for use in processing
+preprocessor = TextPreprocessor()
+
+# Debug: Log initialization of this module.
+logger.debug("src/main.py module loaded. Contains argparse CLI functions.")
+
+
+class ProcessingError:
+    """Container for processing error details."""
+
+    def __init__(self, line_number: int, document_id: str, error_type: str, error_message: str, raw_data_sample: str = ""):
+        self.line_number = line_number
+        self.document_id = document_id
+        self.error_type = error_type
+        self.error_message = error_message
+        self.raw_data_sample = raw_data_sample
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "line_number": self.line_number,
+            "document_id": self.document_id,
+            "error_type": self.error_type,
+            "error_message": self.error_message,
+            "raw_data_sample": self.raw_data_sample
+        }
+
+
+class ProcessingStats:
+    """Statistics tracker for batch processing."""
+
+    def __init__(self):
+        self.total_lines = 0
+        self.empty_lines = 0
+        self.success_count = 0
+        self.json_decode_errors = 0
+        self.validation_errors = 0
+        self.processing_errors = 0
+        self.errors: List[ProcessingError] = []
+
+    def add_error(self, error: ProcessingError):
+        self.errors.append(error)
+
+    def get_summary(self) -> Dict[str, Any]:
+        return {
+            "total_lines": self.total_lines,
+            "empty_lines": self.empty_lines,
+            "processed_successfully": self.success_count,
+            "json_decode_errors": self.json_decode_errors,
+            "validation_errors": self.validation_errors,
+            "processing_errors": self.processing_errors,
+            "total_errors": len(self.errors),
+            "success_rate": f"{(self.success_count / max(1, self.total_lines - self.empty_lines)) * 100:.1f}%"
+        }
+
+
+def _sanitize_url(url: str) -> Optional[str]:
+    """
+    Attempt to fix common URL issues.
+
+    Args:
+        url: Potentially malformed URL
+
+    Returns:
+        Sanitized URL or None if unfixable
+    """
+    if not url or not isinstance(url, str):
+        return None
+
+    # Fix common typos
+    url = url.strip()
+
+    # Fix double dots in scheme (https.://)
+    url = url.replace('https.://', 'https://')
+    url = url.replace('http.://', 'http://')
+
+    # Fix double s in scheme (httpss://)
+    url = url.replace('httpss://', 'https://')
+    url = url.replace('httpps://', 'https://')
+
+    # Ensure scheme is present
+    if not url.startswith(('http://', 'https://')):
+        # Try to add https:// if it looks like a domain
+        if '.' in url and not url.startswith('//'):
+            url = 'https://' + url
+
+    return url if url.startswith(('http://', 'https://')) else None
+
+
+def _process_single_article(
+    article_data: Dict[str, Any],
+    custom_cleaning_config: Optional[Dict[str, Any]] = None,
+    line_number: int = 0,
+    stats: Optional[ProcessingStats] = None
+) -> Optional[PreprocessFileResult]:
+    """
+    Helper function to process a single article's data from the input file.
+    This function includes the processing logic and error handling for one item.
+
+    Args:
+        article_data: Raw article data dictionary
+        custom_cleaning_config: Optional custom cleaning configuration
+        line_number: Line number in input file (for error reporting)
+        stats: Statistics tracker
+
+    Returns:
+        PreprocessFileResult or None if processing fails
+    """
+    document_id = article_data.get('document_id', f'line-{line_number}')
+
+    try:
+        # 1. Sanitize URLs before validation
+        if 'source_url' in article_data and article_data['source_url']:
+            sanitized_url = _sanitize_url(article_data['source_url'])
+            if sanitized_url:
+                article_data['source_url'] = sanitized_url
+                logger.debug(f"Sanitized source_url for {document_id}")
+            else:
+                logger.warning(
+                    f"Could not sanitize source_url for {document_id}, removing field")
+                article_data.pop('source_url', None)
+
+        # Sanitize media URLs
+        if 'media_asset_urls' in article_data and article_data['media_asset_urls']:
+            sanitized_media = []
+            for url in article_data['media_asset_urls']:
+                sanitized = _sanitize_url(url)
+                if sanitized:
+                    sanitized_media.append(sanitized)
+            article_data['media_asset_urls'] = sanitized_media if sanitized_media else None
+
+        # 2. Input Data Validation: Validate the input data against the ArticleInput schema.
+        input_article = ArticleInput.model_validate(article_data)
+
+        # Use the document_id from the validated input for traceability
+        document_id = input_article.document_id
+
+        # 3. Core Processing: Process the text and all relevant metadata using the core preprocessor.
+        processed_data_dict = preprocessor.preprocess(
+            text=input_article.text,
+            document_id=input_article.document_id,
+            title=input_article.title,
+            excerpt=input_article.excerpt,
+            author=input_article.author,
+            publication_date=input_article.publication_date,
+            revision_date=input_article.revision_date,
+            source_url=input_article.source_url,
+            categories=input_article.categories,
+            tags=input_article.tags,
+            media_asset_urls=input_article.media_asset_urls,
+            geographical_data=input_article.geographical_data,
+            embargo_date=input_article.embargo_date,
+            sentiment=input_article.sentiment,
+            word_count=input_article.word_count,
+            publisher=input_article.publisher,
+            additional_metadata=input_article.additional_metadata,
+            custom_cleaning_config=custom_cleaning_config
+        )
+
+        # 4. Output Data Validation and return as dictionary
+        response = PreprocessSingleResponse(
+            version="1.0",
+            **processed_data_dict
+        )
+
+        # 5. Persist to storage backends
+        backends = StorageBackendFactory.get_backends()
+        for backend in backends:
+            backend.save(response)
+
+        # 6. Update stats
+        if stats:
+            stats.success_count += 1
+
+        # 7. Construct the final result object with the unique ID.
+        return PreprocessFileResult(
+            document_id=document_id,
+            version="1.0",
+            processed_data=response
+        )
+
+    except ValidationError as e:
+        if stats:
+            stats.validation_errors += 1
+            error = ProcessingError(
+                line_number=line_number,
+                document_id=document_id,
+                error_type="ValidationError",
+                error_message=str(e.errors()[:3]),  # First 3 errors only
+                raw_data_sample=str(article_data)[:200]
+            )
+            stats.add_error(error)
+
+        logger.warning(
+            f"Line {line_number}: Validation error for document_id={document_id}. Skipping. "
+            f"Errors: {e.errors()[:2]}"  # Log first 2 errors
+        )
+        return None
+
+    except Exception as e:
+        if stats:
+            stats.processing_errors += 1
+            error = ProcessingError(
+                line_number=line_number,
+                document_id=document_id,
+                error_type=type(e).__name__,
+                error_message=str(e)[:200],
+                raw_data_sample=str(article_data)[:200]
+            )
+            stats.add_error(error)
+
+        logger.error(
+            f"Line {line_number}: Processing error for document_id={document_id}. Skipping. "
+            f"Error: {str(e)[:100]}"
+        )
+        return None
+
+
+def preprocess_file(
+    input_path: str,
+    output_path: str,
+    use_celery: bool = False,
+    custom_cleaning_config: Optional[Dict[str, Any]] = None
+) -> ProcessingStats:
+    """
+    Processes a file containing structured article objects (one per line) in parallel.
+    Can optionally submit tasks to Celery for asynchronous processing.
+    Saves results to storage backends in addition to the output file.
+
+    Args:
+        input_path: Path to input JSONL file
+        output_path: Path to output JSONL file
+        use_celery: If True, submit to Celery workers; if False, process locally
+        custom_cleaning_config: Optional custom cleaning configuration dict
+
+    Returns:
+        ProcessingStats with detailed results
+    """
+    input_file_path = Path(input_path)
+    output_file_path = Path(output_path)
+
+    if not input_file_path.exists():
+        print(
+            f"Error: Input file not found at {input_file_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Ensure output directory exists
+    output_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Initialize statistics tracker
+    stats = ProcessingStats()
+
+    print(f"Starting batch preprocessing of file: {input_file_path}")
+    logger.info(
+        f"Starting CLI batch processing from file '{input_file_path}'.")
+
+    with open(input_file_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+
+    stats.total_lines = len(lines)
+
+    if use_celery:
+        print(
+            f"Submitting {len(lines)} articles to Celery for asynchronous processing...")
+        logger.info(f"Submitting {len(lines)} articles to Celery via CLI.")
+
+        task_results = []
+        for i, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line:
+                stats.empty_lines += 1
+                continue
+
+            # Use sophisticated JSON sanitizer
+            article_data, parse_error = sanitize_and_parse_json(line, i)
+
+            if article_data is None:
+                # JSON parsing failed
+                stats.json_decode_errors += 1
+                error = ProcessingError(
+                    line_number=i,
+                    document_id=f"line-{i}",
+                    error_type="JSONDecodeError",
+                    error_message=parse_error or "Could not parse JSON",
+                    raw_data_sample=line[:200]
+                )
+                stats.add_error(error)
+                logger.warning(f"Line {i}: {parse_error}")
+                continue
+
+            # Sanitize URLs before sending to Celery
+            if 'source_url' in article_data:
+                article_data['source_url'] = _sanitize_url(
+                    article_data['source_url'])
+            if 'media_asset_urls' in article_data:
+                article_data['media_asset_urls'] = [
+                    url for url in [_sanitize_url(u) for u in article_data['media_asset_urls']]
+                    if url
+                ] or None
+
+            # Send the article data to Celery task
+            task = preprocess_article_task.delay(
+                json.dumps(article_data),
+                json.dumps(
+                    custom_cleaning_config) if custom_cleaning_config else None
+            )
+            task_results.append(
+                (i, task, article_data.get('document_id', f'line-{i}')))
+
+        print(f"\nAll tasks submitted. Waiting for results...")
+        logger.info(f"All Celery tasks submitted. Retrieving results...")
+
+        output_lines = []
+        for i, task, doc_id in tqdm(task_results, desc="Retrieving Celery Results"):
+            if task:
+                try:
+                    result_dict = task.get(timeout=3600)
+                    if result_dict and not result_dict.get("error"):
+                        processed_result = PreprocessFileResult(
+                            document_id=result_dict.get("document_id", doc_id),
+                            version="1.0",
+                            processed_data=PreprocessSingleResponse.model_validate(
+                                result_dict)
+                        )
+                        output_lines.append(processed_result.model_dump_json())
+                        stats.success_count += 1
+
+                        # Save to storage backends
+                        backends = StorageBackendFactory.get_backends()
+                        for backend in backends:
+                            backend.save(processed_result.processed_data)
+                    else:
+                        stats.processing_errors += 1
+                        error = ProcessingError(
+                            line_number=i,
+                            document_id=doc_id,
+                            error_type="CeleryTaskError",
+                            error_message=str(result_dict.get(
+                                "error", "Unknown error"))[:200],
+                            raw_data_sample=""
+                        )
+                        stats.add_error(error)
+                        logger.error(
+                            f"Celery task failed for line {i}, document_id={doc_id}")
+
+                except Exception as e:
+                    stats.processing_errors += 1
+                    error = ProcessingError(
+                        line_number=i,
+                        document_id=doc_id,
+                        error_type="CeleryRetrievalError",
+                        error_message=str(e)[:200],
+                        raw_data_sample=""
+                    )
+                    stats.add_error(error)
+                    logger.error(
+                        f"Failed to retrieve result for line {i}: {e}")
+
+    else:  # Synchronous multi-threaded processing
+        num_threads = settings.ingestion_service.batch_processing_threads
+        print(
+            f"Using {num_threads} threads for synchronous parallel processing...")
+
+        output_lines = []
+        futures_map = {}  # Map future to line number
+
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            for i, line in enumerate(lines, 1):
+                line = line.strip()
+                if not line:
+                    stats.empty_lines += 1
+                    continue
+
+                # Use sophisticated JSON sanitizer
+                article_data, parse_error = sanitize_and_parse_json(line, i)
+
+                if article_data is None:
+                    # JSON parsing failed even after all sanitization attempts
+                    stats.json_decode_errors += 1
+                    error = ProcessingError(
+                        line_number=i,
+                        document_id=f"line-{i}",
+                        error_type="JSONDecodeError",
+                        error_message=parse_error or "Could not parse JSON",
+                        raw_data_sample=line[:200]
+                    )
+                    stats.add_error(error)
+                    logger.warning(f"Line {i}: {parse_error}")
+                    continue
+
+                # Successfully parsed, submit for processing
+                future = executor.submit(
+                    _process_single_article,
+                    article_data,
+                    custom_cleaning_config,
+                    i,  # Pass line number
+                    stats  # Pass stats tracker
+                )
+                futures_map[future] = i
+
+            for future in tqdm(as_completed(futures_map), total=len(futures_map), desc="Processing"):
+                processed_result = future.result()
+                if processed_result:
+                    output_lines.append(processed_result.model_dump_json())
+
+    # Write the processed outputs to the output file in JSONL format
+    with open(output_file_path, 'w', encoding='utf-8') as f:
+        for line in output_lines:
+            f.write(line + '\n')
+
+    # Print summary
+    _print_processing_summary(stats, output_file_path)
+
+    logger.info(
+        f"CLI batch processing finished. Results saved to '{output_file_path}'.")
+    return stats
+
+
+def _print_processing_summary(stats: ProcessingStats, output_path: Path):
+    """Print detailed processing summary."""
+    print("\n" + "="*70)
+    print("PROCESSING SUMMARY")
+    print("="*70)
+
+    summary = stats.get_summary()
+    print(f"Total lines in file:       {summary['total_lines']}")
+    print(f"Empty lines skipped:       {summary['empty_lines']}")
+    print(f"Successfully processed:    {summary['processed_successfully']}")
+    print(f"JSON decode errors:        {summary['json_decode_errors']}")
+    print(f"Validation errors:         {summary['validation_errors']}")
+    print(f"Processing errors:         {summary['processing_errors']}")
+    print(f"Total errors:              {summary['total_errors']}")
+    print(f"Success rate:              {summary['success_rate']}")
+    print(f"\nResults written to: {output_path}")
+
+    if stats.errors:
+        print("\n" + "-"*70)
+        print("ERROR DETAILS (first 10)")
+        print("-"*70)
+
+        for i, error in enumerate(stats.errors[:10], 1):
+            print(f"\n{i}. Line {error.line_number} - {error.error_type}")
+            print(f"   Document ID: {error.document_id}")
+            print(f"   Error: {error.error_message[:150]}")
+            if error.raw_data_sample:
+                print(f"   Sample: {error.raw_data_sample[:100]}...")
+
+        if len(stats.errors) > 10:
+            print(f"\n... and {len(stats.errors) - 10} more errors")
+            print(
+                f"\nTo see all errors, check the log file: logs/ingestion_service.jsonl")
+
+        # Save detailed error report
+        error_report_path = output_path.parent / \
+            f"{output_path.stem}_errors.json"
+        with open(error_report_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                "summary": summary,
+                "errors": [e.to_dict() for e in stats.errors]
+            }, f, indent=2)
+        print(f"\nDetailed error report saved to: {error_report_path}")
+
+    print("="*70 + "\n")
+
+# src/main.py
+
+===== END: ./src//main.py =====
+
