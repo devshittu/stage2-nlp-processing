@@ -78,6 +78,19 @@ logger = get_logger(__name__, service="celery_worker")
 settings = get_settings()
 celery_config = settings.celery
 
+# Initialize event publisher for inter-stage communication
+event_publisher = None
+try:
+    from src.events.publisher import create_event_publisher
+    event_publisher = create_event_publisher(settings)
+    if settings.events.enabled:
+        logger.info(f"Event publisher initialized with backend: {settings.events.backend}")
+    else:
+        logger.info("Event publisher disabled (events.enabled = false)")
+except Exception as e:
+    logger.error(f"Failed to initialize event publisher: {e}", exc_info=True)
+    event_publisher = None
+
 # =============================================================================
 # Processing Constants
 # =============================================================================
@@ -793,6 +806,21 @@ def process_batch_task(
                 "message": "Empty batch"
             }
 
+        # Publish batch.started event
+        if event_publisher and settings.events.enabled and settings.events.publish_events.batch_started:
+            try:
+                event_publisher.publish_batch_started(
+                    job_id=task_id,
+                    total_documents=total_docs,
+                    metadata={
+                        "batch_id": batch_id,
+                        "started_at": start_time.isoformat() + "Z"
+                    }
+                )
+                logger.info(f"Published batch.started event for job {task_id}")
+            except Exception as e:
+                logger.warning(f"Failed to publish batch.started event: {e}")
+
         # Use cached models (loaded once per worker)
         logger.info("Using cached NLP models")
         storage_writer = MultiBackendWriter()
@@ -1009,6 +1037,39 @@ def process_batch_task(
             batch_id=batch_id,
             task_id=task_id
         )
+
+        # Publish batch.completed event
+        if event_publisher and settings.events.enabled and settings.events.publish_events.batch_completed:
+            try:
+                # Determine output locations
+                output_locations = {}
+                if save_stats:
+                    if save_stats.get("jsonl"):
+                        output_locations["jsonl"] = f"file:///app/data/extracted_events_{datetime.utcnow().strftime('%Y-%m-%d')}.jsonl"
+                    if save_stats.get("postgresql"):
+                        output_locations["postgresql"] = f"postgresql://db/batch/{batch_id}"
+                    if save_stats.get("elasticsearch"):
+                        output_locations["elasticsearch"] = f"http://es:9200/batch/{batch_id}"
+
+                event_publisher.publish_batch_completed(
+                    job_id=task_id,
+                    total_documents=total_docs,
+                    successful=documents_processed,
+                    failed=documents_failed,
+                    duration_seconds=total_time_ms / 1000.0,
+                    started_at=start_time,
+                    output_locations=output_locations,
+                    aggregate_metrics={
+                        "total_events": total_events,
+                        "total_entities": total_entities,
+                        "linkages_count": len(linkages),
+                        "storylines_count": len(storylines),
+                        "avg_processing_time_ms": total_time_ms / total_docs if total_docs > 0 else 0
+                    }
+                )
+                logger.info(f"Published batch.completed event for job {task_id}")
+            except Exception as e:
+                logger.warning(f"Failed to publish batch.completed event: {e}")
 
         return result
 
