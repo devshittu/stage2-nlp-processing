@@ -388,6 +388,86 @@ caching:
   prompt_cache_size_mb: 2048  # 2GB for cached prompts
 
 # =============================================================================
+# INTER-STAGE COMMUNICATION (Event Publishing)
+# =============================================================================
+events:
+  # Global enable/disable (backward compatibility - disabled by default)
+  enabled: false
+
+  # Single backend mode (backward compatible)
+  backend: "redis_streams"
+
+  # Multi-backend mode - publish to multiple backends simultaneously
+  # Uncomment to enable multiple backends (Redis Streams + Webhooks)
+  # If 'backends' is set, it takes precedence over 'backend'
+  # backends:
+  #   - "redis_streams"
+  #   - "webhook"
+
+  # Event filtering - control which events to publish
+  publish_events:
+    document_processed: true
+    document_failed: true
+    batch_started: true
+    batch_completed: true
+
+  # Redis Streams configuration (default backend)
+  redis_streams:
+    url: "redis://redis:6379/1"  # Same as caching Redis
+    stream_name: "nlp-events"
+    max_len: 10000  # Maximum stream length (older entries trimmed)
+    ttl_seconds: 86400  # 24 hours retention
+    connection_pool:
+      max_connections: 10
+      timeout: 5
+
+  # Kafka configuration (for high-throughput deployments)
+  kafka:
+    bootstrap_servers:
+      - "kafka:9092"
+    topic: "nlp-document-events"
+    compression_type: "gzip"
+    acks: 1  # 0=none, 1=leader, -1=all replicas
+    retries: 3
+    max_in_flight_requests: 5
+    client_id: "stage2-nlp-producer"
+
+  # NATS configuration (for cloud-native deployments)
+  nats:
+    servers:
+      - "nats://nats:4222"
+    subject: "nlp.document.processed"
+    jetstream: true
+    stream: "NLP_EVENTS"
+    durable_name: "nlp-processor"
+
+  # RabbitMQ configuration (for flexible routing)
+  rabbitmq:
+    url: "amqp://guest:guest@rabbitmq:5672/"
+    exchange: "nlp-events"
+    exchange_type: "topic"
+    routing_key: "document.processed"
+    durable: true
+
+  # Webhook configuration (for HTTP callbacks)
+  webhook:
+    urls:
+      - "http://stage3-embedding:8000/webhook/nlp-events"
+    headers:
+      X-API-Key: "${WEBHOOK_API_KEY}"  # From environment
+    timeout_seconds: 5
+    retry_attempts: 3
+    retry_backoff: "exponential"  # or "linear"
+    retry_delay_seconds: 1
+    verify_ssl: true
+
+  # Monitoring and observability for events
+  monitoring:
+    track_publish_latency: true
+    log_events: true
+    log_level: "INFO"  # DEBUG for detailed event payloads
+
+# =============================================================================
 # MONITORING & OBSERVABILITY
 # =============================================================================
 monitoring:
