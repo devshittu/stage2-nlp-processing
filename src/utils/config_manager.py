@@ -241,6 +241,90 @@ class CachingSettings(BaseModel):
     prompt_cache_size_mb: int = Field(default=2048)
 
 
+class ConnectionPoolConfig(BaseModel):
+    """Connection pool configuration for Redis Streams."""
+    max_connections: int = Field(default=10)
+    timeout: int = Field(default=5)
+
+
+class RedisStreamsConfig(BaseModel):
+    """Redis Streams backend configuration."""
+    url: str = Field(default="redis://redis:6379/1")
+    stream_name: str = Field(default="nlp-events")
+    max_len: int = Field(default=10000)
+    ttl_seconds: int = Field(default=86400)
+    connection_pool: ConnectionPoolConfig = Field(default_factory=ConnectionPoolConfig)
+
+
+class KafkaConfig(BaseModel):
+    """Kafka backend configuration."""
+    bootstrap_servers: List[str] = Field(default_factory=lambda: ["kafka:9092"])
+    topic: str = Field(default="nlp-document-events")
+    compression_type: str = Field(default="gzip")
+    acks: int = Field(default=1)
+    retries: int = Field(default=3)
+    max_in_flight_requests: int = Field(default=5)
+    client_id: str = Field(default="stage2-nlp-producer")
+
+
+class NATSConfig(BaseModel):
+    """NATS backend configuration."""
+    servers: List[str] = Field(default_factory=lambda: ["nats://nats:4222"])
+    subject: str = Field(default="nlp.document.processed")
+    jetstream: bool = Field(default=True)
+    stream: str = Field(default="NLP_EVENTS")
+    durable_name: str = Field(default="nlp-processor")
+
+
+class RabbitMQConfig(BaseModel):
+    """RabbitMQ backend configuration."""
+    url: str = Field(default="amqp://guest:guest@rabbitmq:5672/")
+    exchange: str = Field(default="nlp-events")
+    exchange_type: str = Field(default="topic")
+    routing_key: str = Field(default="document.processed")
+    durable: bool = Field(default=True)
+
+
+class WebhookConfig(BaseModel):
+    """Webhook backend configuration."""
+    urls: List[str] = Field(default_factory=list)
+    headers: Dict[str, str] = Field(default_factory=dict)
+    timeout_seconds: int = Field(default=5)
+    retry_attempts: int = Field(default=3)
+    retry_backoff: str = Field(default="exponential")
+    retry_delay_seconds: float = Field(default=1.0)
+    verify_ssl: bool = Field(default=True)
+
+
+class PublishEventsConfig(BaseModel):
+    """Event filtering configuration."""
+    document_processed: bool = Field(default=True)
+    document_failed: bool = Field(default=True)
+    batch_started: bool = Field(default=True)
+    batch_completed: bool = Field(default=True)
+
+
+class EventMonitoringConfig(BaseModel):
+    """Event monitoring configuration."""
+    track_publish_latency: bool = Field(default=True)
+    log_events: bool = Field(default=True)
+    log_level: str = Field(default="INFO")
+
+
+class EventsConfig(BaseModel):
+    """Inter-stage communication event publishing configuration."""
+    enabled: bool = Field(default=False, description="Global enable/disable for events")
+    backend: Optional[str] = Field(default="redis_streams", description="Single backend type (deprecated, use backends)")
+    backends: Optional[List[str]] = Field(default=None, description="Multiple backend types to use simultaneously")
+    publish_events: PublishEventsConfig = Field(default_factory=PublishEventsConfig)
+    redis_streams: RedisStreamsConfig = Field(default_factory=RedisStreamsConfig)
+    kafka: KafkaConfig = Field(default_factory=KafkaConfig)
+    nats: NATSConfig = Field(default_factory=NATSConfig)
+    rabbitmq: RabbitMQConfig = Field(default_factory=RabbitMQConfig)
+    webhook: WebhookConfig = Field(default_factory=WebhookConfig)
+    monitoring: EventMonitoringConfig = Field(default_factory=EventMonitoringConfig)
+
+
 class MonitoringSettings(BaseModel):
     """Monitoring and observability settings."""
     enable_metrics: bool = Field(default=True)
@@ -274,6 +358,7 @@ class Settings(BaseModel):
     celery: CelerySettings = Field(default_factory=CelerySettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
     caching: CachingSettings = Field(default_factory=CachingSettings)
+    events: EventsConfig = Field(default_factory=EventsConfig)
     monitoring: MonitoringSettings = Field(default_factory=MonitoringSettings)
     development: DevelopmentSettings = Field(default_factory=DevelopmentSettings)
 
