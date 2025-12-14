@@ -1,0 +1,74 @@
+# Dockerfile for Orchestrator Service + Celery Workers
+# Includes all NLP models for batch processing
+
+FROM nvidia/cuda:12.1.0-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
+    python3-dev \
+    build-essential \
+    cmake \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --upgrade pip setuptools wheel
+
+COPY requirements.txt /app/
+
+# Install PyTorch with CUDA support
+RUN pip3 install torch==2.1.2+cu121 torchvision==0.16.2+cu121 \
+    --extra-index-url https://download.pytorch.org/whl/cu121
+
+# Install all NLP dependencies
+# Transformers
+RUN pip3 install transformers==4.36.2 tokenizers==0.15.0 \
+    accelerate==0.25.0 safetensors==0.4.1
+
+# spaCy
+RUN pip3 install spacy==3.7.2 && \
+    pip3 install https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.7.2/en_core_web_trf-3.7.2-py3-none-any.whl
+
+# vLLM
+RUN pip3 install vllm==0.2.7 ray==2.9.1 autoawq==0.1.8
+
+# Sentence Transformers
+RUN pip3 install sentence-transformers==2.3.1
+
+# Celery and Dask for batch processing
+RUN pip3 install celery==5.3.4 redis==5.0.1 \
+    dask[complete]==2024.1.0 distributed==2024.1.0 bokeh==3.3.3
+
+# Web framework
+RUN pip3 install fastapi==0.109.0 uvicorn[standard]==0.27.0 \
+    pydantic==2.5.3 pydantic-settings==2.1.0
+
+# Database drivers
+RUN pip3 install psycopg2-binary==2.9.9 elasticsearch==8.11.1
+
+# Utilities
+RUN pip3 install PyYAML==6.0.1 httpx==0.26.0 aiohttp==3.9.1 \
+    python-json-logger==2.0.7 prometheus-client==0.19.0 \
+    prometheus-fastapi-instrumentator==6.1.0 \
+    numpy==1.26.3 scikit-learn==1.4.0 scipy==1.11.4 \
+    click==8.1.7 rich==13.7.0 python-dateutil==2.8.2 \
+    python-multipart==0.0.6 python-dotenv==1.0.0 ujson==5.9.0 tqdm==4.66.1
+
+# Copy application code
+COPY src/ /app/src/
+COPY config/ /app/config/
+
+RUN mkdir -p /app/logs /app/data
+
+EXPOSE 8000
+
+ENV PYTHONPATH=/app
+
+# Default command runs orchestrator (can be overridden for celery workers)
+CMD ["python3", "-m", "src.api.orchestrator_service"]

@@ -1,0 +1,58 @@
+# Dockerfile for NER Service
+# Optimized for GPU inference with CUDA 12.1
+
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
+    python3-dev \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip
+RUN pip3 install --upgrade pip setuptools wheel
+
+# Copy requirements first for better caching
+COPY requirements.txt /app/
+
+# Install Python dependencies
+# Install PyTorch with CUDA 12.1 support first
+RUN pip3 install torch==2.1.2+cu121 torchvision==0.16.2+cu121 \
+    --extra-index-url https://download.pytorch.org/whl/cu121
+
+# Install transformers and NLP libraries
+RUN pip3 install transformers==4.36.2 tokenizers==0.15.0 \
+    accelerate==0.25.0 safetensors==0.4.1 \
+    sentence-transformers==2.3.1
+
+# Install other dependencies
+RUN pip3 install fastapi==0.109.0 uvicorn[standard]==0.27.0 \
+    pydantic==2.5.3 pydantic-settings==2.1.0 \
+    redis==5.0.1 PyYAML==6.0.1 httpx==0.26.0 \
+    python-json-logger==2.0.7 numpy==1.26.3 \
+    scikit-learn==1.4.0 click==8.1.7 python-multipart==0.0.6
+
+# Copy application code
+COPY src/ /app/src/
+COPY config/ /app/config/
+
+# Create necessary directories
+RUN mkdir -p /app/logs /app/data
+
+# Expose port
+EXPOSE 8001
+
+# Set Python path
+ENV PYTHONPATH=/app
+
+# Run NER service
+CMD ["python3", "-m", "src.api.ner_service"]

@@ -1,0 +1,59 @@
+# Dockerfile for Event LLM Service with vLLM
+# Requires CUDA 12.1 and substantial VRAM (16GB+)
+
+FROM nvidia/cuda:12.1.0-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /app
+
+# Install system dependencies including build tools for vLLM
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
+    python3-dev \
+    build-essential \
+    cmake \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --upgrade pip setuptools wheel
+
+COPY requirements.txt /app/
+
+# Install PyTorch with CUDA support (from requirements.txt)
+RUN pip3 install torch==2.5.1+cu121 torchvision==0.20.1+cu121 \
+    --extra-index-url https://download.pytorch.org/whl/cu121
+
+# Install vLLM (requires CUDA development tools) - updated to match requirements.txt
+RUN pip3 install vllm==0.6.3.post1 ray==2.39.0
+
+# Install transformers and quantization libraries - updated to match requirements.txt
+RUN pip3 install transformers==4.46.0 tokenizers==0.20.3 \
+    accelerate==1.1.1 safetensors==0.4.5 \
+    autoawq==0.2.7.post3
+
+# Install sentence transformers for event linking - updated to match requirements.txt
+RUN pip3 install sentence-transformers==3.3.0
+
+# Install other dependencies - numpy downgraded for vLLM compatibility
+RUN pip3 install fastapi==0.115.0 uvicorn[standard]==0.32.0 \
+    pydantic==2.10.0 pydantic-settings==2.6.1 \
+    PyYAML==6.0.2 httpx==0.28.0 \
+    python-json-logger==3.2.0 "numpy<2.0.0" \
+    scikit-learn==1.5.2 click==8.1.7 python-multipart==0.0.12
+
+# Copy application code
+COPY src/ /app/src/
+COPY config/ /app/config/
+
+RUN mkdir -p /app/logs /app/data
+
+EXPOSE 8003
+
+ENV PYTHONPATH=/app
+# Increase shared memory for vLLM
+ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+CMD ["python3", "-m", "src.api.event_llm_service"]

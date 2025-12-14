@@ -1,0 +1,51 @@
+# Dockerfile for Dependency Parsing Service
+# Optimized for GPU inference with CUDA 12.1
+
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
+    python3-dev \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --upgrade pip setuptools wheel
+
+COPY requirements.txt /app/
+
+# Install PyTorch with CUDA support
+RUN pip3 install torch==2.1.2+cu121 torchvision==0.16.2+cu121 \
+    --extra-index-url https://download.pytorch.org/whl/cu121
+
+# Install CuPy for spaCy GPU support
+RUN pip3 install cupy-cuda12x==13.0.0
+
+# Install spaCy and transformer model
+RUN pip3 install spacy==3.7.2 && \
+    pip3 install https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.7.2/en_core_web_trf-3.7.2-py3-none-any.whl
+
+# Install other dependencies
+RUN pip3 install fastapi==0.109.0 uvicorn[standard]==0.27.0 \
+    pydantic==2.5.3 pydantic-settings==2.1.0 \
+    PyYAML==6.0.1 httpx==0.26.0 \
+    python-json-logger==2.0.7 numpy==1.26.3 \
+    click==8.1.7 python-multipart==0.0.6
+
+# Copy application code
+COPY src/ /app/src/
+COPY config/ /app/config/
+
+RUN mkdir -p /app/logs /app/data
+
+EXPOSE 8002
+
+ENV PYTHONPATH=/app
+
+CMD ["python3", "-m", "src.api.dp_service"]
