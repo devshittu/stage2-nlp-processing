@@ -1,0 +1,315 @@
+# Stage 2 NLP Processing Service - Docker Compose Configuration
+# Docker Compose v2 syntax
+# Optimized for 48-core Threadripper, 160GB RAM, RTX A4000 (16GB VRAM)
+
+services:
+  # =============================================================================
+  # REDIS (Celery Broker & Caching)
+  # =============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: nlp-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nlp-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # NER SERVICE (Port 8001)
+  # =============================================================================
+  ner-service:
+    build:
+      context: .
+      dockerfile: Dockerfile_ner
+    container_name: nlp-ner-service
+    ports:
+      - "8001:8001"
+    environment:
+      - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CUDA_VISIBLE_DEVICES=${NER_GPU_ID:-0}  # Use env var or default to GPU 0
+    env_file:
+      - .env
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+      - huggingface_cache:/root/.cache/huggingface
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - nlp-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # DEPENDENCY PARSING SERVICE (Port 8002)
+  # =============================================================================
+  dp-service:
+    build:
+      context: .
+      dockerfile: Dockerfile_dp
+    container_name: nlp-dp-service
+    ports:
+      - "8002:8002"
+    environment:
+      - CUDA_VISIBLE_DEVICES=${DP_GPU_ID:-0}  # Use env var or default to GPU 0
+    env_file:
+      - .env
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+      - spacy_models:/root/.local/share/spacy
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - nlp-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # EVENT LLM SERVICE (Port 8003)
+  # =============================================================================
+  event-llm-service:
+    build:
+      context: .
+      dockerfile: Dockerfile_event_llm
+    container_name: nlp-event-llm-service
+    ports:
+      - "8003:8003"
+    environment:
+      - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN}
+      - CUDA_VISIBLE_DEVICES=${EVENT_LLM_GPU_ID:-0}  # Use env var or default to GPU 0
+    env_file:
+      - .env
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+      - huggingface_cache:/root/.cache/huggingface
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          memory: 20G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - nlp-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # ORCHESTRATOR SERVICE (Port 8000) + CELERY WORKERS
+  # =============================================================================
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile_orchestrator
+    container_name: nlp-orchestrator
+    ports:
+      - "8000:8000"
+    environment:
+      - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - NER_SERVICE_URL=http://ner-service:8001
+      - DP_SERVICE_URL=http://dp-service:8002
+      - EVENT_LLM_SERVICE_URL=http://event-llm-service:8003
+      - CUDA_VISIBLE_DEVICES=${ORCHESTRATOR_GPU_ID:-}  # Optional GPU access
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+    env_file:
+      - .env
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - huggingface_cache:/root/.cache/huggingface
+    depends_on:
+      redis:
+        condition: service_healthy
+      ner-service:
+        condition: service_healthy
+      dp-service:
+        condition: service_healthy
+      event-llm-service:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          cpus: '24'
+          memory: 140G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - nlp-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # CELERY WORKER (Background Processing)
+  # =============================================================================
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile_orchestrator
+    container_name: nlp-celery-worker
+    command: celery -A src.core.celery_tasks worker --loglevel=info --concurrency=4
+    environment:
+      - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - NER_SERVICE_URL=http://ner-service:8001
+      - DP_SERVICE_URL=http://dp-service:8002
+      - EVENT_LLM_SERVICE_URL=http://event-llm-service:8003
+      - CUDA_VISIBLE_DEVICES=${CELERY_GPU_ID:-}  # Optional GPU access for event linking
+    env_file:
+      - .env
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - huggingface_cache:/root/.cache/huggingface
+    depends_on:
+      redis:
+        condition: service_healthy
+      ner-service:
+        condition: service_healthy
+      dp-service:
+        condition: service_healthy
+      event-llm-service:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          cpus: '24'
+          memory: 140G
+    networks:
+      - nlp-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # OPTIONAL: POSTGRESQL (Uncomment to enable)
+  # =============================================================================
+  # postgres:
+  #   image: postgres:16-alpine
+  #   container_name: nlp-postgres
+  #   ports:
+  #     - "5432:5432"
+  #   environment:
+  #     - POSTGRES_DB=nlp_processing
+  #     - POSTGRES_USER=nlp_user
+  #     - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U nlp_user"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   networks:
+  #     - nlp-network
+  #   restart: unless-stopped
+
+  # =============================================================================
+  # OPTIONAL: ELASTICSEARCH (Uncomment to enable)
+  # =============================================================================
+  # elasticsearch:
+  #   image: docker.elastic.co/elasticsearch/elasticsearch:8.11.3
+  #   container_name: nlp-elasticsearch
+  #   environment:
+  #     - discovery.type=single-node
+  #     - xpack.security.enabled=false
+  #     - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+  #   ports:
+  #     - "9200:9200"
+  #     - "9300:9300"
+  #   volumes:
+  #     - elasticsearch_data:/usr/share/elasticsearch/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #   networks:
+  #     - nlp-network
+  #   restart: unless-stopped
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  nlp-network:
+    driver: bridge
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  redis_data:
+    driver: local
+  huggingface_cache:
+    driver: local
+  spacy_models:
+    driver: local
+  # postgres_data:
+  #   driver: local
+  # elasticsearch_data:
+  #   driver: local
