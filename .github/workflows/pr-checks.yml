@@ -1,0 +1,148 @@
+name: PR Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  pr-info:
+    name: PR Information
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v41
+        with:
+          files: |
+            src/**/*.py
+            requirements.txt
+            docker-compose.yml
+            .github/workflows/*.yml
+
+      - name: Analyze changes
+        run: |
+          echo "## Pull Request Analysis" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.head_ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Base:** ${{ github.base_ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Changed Files" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.changed-files.outputs.all_changed_files }}" | tr ' ' '\n' | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY
+
+      - name: Check PR size
+        run: |
+          ADDITIONS=$(git diff --numstat ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }} | awk '{sum+=$1} END {print sum}')
+          DELETIONS=$(git diff --numstat ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }} | awk '{sum+=$2} END {print sum}')
+          TOTAL=$((ADDITIONS + DELETIONS))
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Code Changes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Additions: +$ADDITIONS" >> $GITHUB_STEP_SUMMARY
+          echo "- Deletions: -$DELETIONS" >> $GITHUB_STEP_SUMMARY
+          echo "- Total: $TOTAL lines" >> $GITHUB_STEP_SUMMARY
+
+          if [ $TOTAL -gt 1000 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **Warning:** This PR is large (>1000 lines). Consider splitting into smaller PRs." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  code-review:
+    name: Automated Code Review
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install pylint radon
+          pip install fastapi pydantic httpx
+
+      - name: Run Pylint
+        continue-on-error: true
+        run: |
+          echo "## Code Quality Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          pylint src/ --exit-zero --output-format=text | tee pylint-report.txt
+          SCORE=$(grep "Your code has been rated" pylint-report.txt | awk '{print $7}' || echo "N/A")
+          echo "**Pylint Score:** $SCORE/10" >> $GITHUB_STEP_SUMMARY
+
+      - name: Calculate code complexity
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Complexity Analysis" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          radon cc src/ -a -nb | head -20 >> $GITHUB_STEP_SUMMARY || true
+
+  dependency-check:
+    name: Dependency Security Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install safety
+        run: pip install safety
+
+      - name: Check dependencies for vulnerabilities
+        continue-on-error: true
+        run: |
+          echo "## Security Scan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          safety check --file requirements.txt --output text | tee safety-report.txt || true
+          if [ -f safety-report.txt ]; then
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            head -50 safety-report.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+  documentation-check:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for updated documentation
+        run: |
+          echo "## Documentation Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f "README.md" ]; then
+            echo "✅ README.md exists" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ README.md missing" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ -f ".env.example" ]; then
+            echo "✅ .env.example exists" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ .env.example missing" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ -d "docs" ] || [ -f "API.md" ]; then
+            echo "✅ API documentation found" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Consider adding API documentation" >> $GITHUB_STEP_SUMMARY
+          fi
