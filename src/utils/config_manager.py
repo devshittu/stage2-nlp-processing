@@ -175,8 +175,8 @@ class CelerySettings(BaseModel):
     result_serializer: str = Field(default="json")
     accept_content: List[str] = Field(default_factory=lambda: ["json"])
     task_routes: Dict[str, str] = Field(default_factory=dict)
-    task_time_limit: int = Field(default=3600)
-    task_soft_time_limit: int = Field(default=3000)
+    task_time_limit: int = Field(default=36000)  # 10 hours
+    task_soft_time_limit: int = Field(default=32400)  # 9 hours
     result_expires: int = Field(default=86400)
     dask_enabled: bool = Field(default=True)
     dask_local_cluster_n_workers: int = Field(default=22)
