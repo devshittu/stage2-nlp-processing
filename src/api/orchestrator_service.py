@@ -121,6 +121,9 @@ event_linker = get_event_linker()
 # Storage writer
 storage_writer: Optional[MultiBackendWriter] = None
 
+# Event publisher for inter-stage communication
+event_publisher: Optional[Any] = None
+
 
 # =============================================================================
 # FastAPI Application Setup with Lifespan
@@ -132,7 +135,7 @@ async def lifespan(app: FastAPI):
     Application lifespan context manager.
     Handles startup and shutdown logic.
     """
-    global http_client, storage_writer
+    global http_client, storage_writer, event_publisher
 
     # Startup
     logger.info("Starting orchestrator service...")
@@ -160,6 +163,18 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize storage writer: {e}", exc_info=True)
         storage_writer = None
 
+    # Initialize event publisher for inter-stage communication
+    try:
+        from src.events.publisher import create_event_publisher
+        event_publisher = create_event_publisher(config)
+        if config.events.enabled:
+            logger.info(f"Event publisher initialized with backend: {config.events.backend}")
+        else:
+            logger.info("Event publisher disabled (events.enabled = false)")
+    except Exception as e:
+        logger.error(f"Failed to initialize event publisher: {e}", exc_info=True)
+        event_publisher = None
+
     logger.info("Orchestrator service started successfully")
 
     yield
@@ -174,6 +189,10 @@ async def lifespan(app: FastAPI):
     if storage_writer:
         storage_writer.close()
         logger.info("Storage writer closed")
+
+    if event_publisher:
+        event_publisher.close()
+        logger.info("Event publisher closed")
 
     logger.info("Orchestrator service shutdown complete")
 
@@ -491,6 +510,7 @@ async def process_single_document(document: Stage1Document) -> ProcessedDocument
         )
 
         # Step 7: Save to storage backends
+        output_locations = {}
         if storage_writer:
             try:
                 save_results = storage_writer.save(processed_doc)
@@ -498,6 +518,13 @@ async def process_single_document(document: Stage1Document) -> ProcessedDocument
                     f"Document saved to storage",
                     extra={"document_id": document_id, "backends": save_results}
                 )
+                # Build output locations dict for event
+                if save_results.get("jsonl"):
+                    output_locations["jsonl"] = f"file:///app/data/extracted_events_{datetime.utcnow().strftime('%Y-%m-%d')}.jsonl"
+                if save_results.get("postgresql"):
+                    output_locations["postgresql"] = f"postgresql://db/documents/{document_id}"
+                if save_results.get("elasticsearch"):
+                    output_locations["elasticsearch"] = f"http://es:9200/documents/{document_id}"
             except Exception as e:
                 logger.error(
                     f"Failed to save document to storage: {e}",
@@ -505,6 +532,32 @@ async def process_single_document(document: Stage1Document) -> ProcessedDocument
                     extra={"document_id": document_id}
                 )
                 # Don't fail the request if storage fails
+
+        # Step 8: Publish document.processed event
+        if event_publisher and config.events.enabled and config.events.publish_events.document_processed:
+            try:
+                event_publisher.publish_document_processed(
+                    document_id=document_id,
+                    job_id=processed_doc.job_id or "single-document",
+                    processing_time_seconds=processing_time_ms / 1000.0,
+                    output_locations=output_locations,
+                    metrics={
+                        "event_count": len(events),
+                        "entity_count": len(entities),
+                        "soa_triplet_count": len(soa_triplets)
+                    },
+                    metadata={
+                        "pipeline_version": "1.0.0",
+                        "model_versions": {
+                            "ner": config.ner_service.model_name,
+                            "dp": config.dp_service.model_name,
+                            "event_extraction": config.event_llm_service.model_name
+                        }
+                    }
+                )
+            except Exception as e:
+                # Log but don't fail - event publishing is non-critical
+                logger.warning(f"Failed to publish document.processed event: {e}")
 
         logger.info(
             f"Pipeline completed successfully for document: {document_id}",
@@ -524,6 +577,20 @@ async def process_single_document(document: Stage1Document) -> ProcessedDocument
             exc_info=True,
             extra={"document_id": document_id, "error": str(e)}
         )
+
+        # Publish document.failed event
+        if event_publisher and config.events.enabled and config.events.publish_events.document_failed:
+            try:
+                event_publisher.publish_document_failed(
+                    document_id=document_id,
+                    job_id="single-document",
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    retry_count=0
+                )
+            except Exception as publish_error:
+                logger.warning(f"Failed to publish document.failed event: {publish_error}")
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Pipeline processing failed: {str(e)}"
