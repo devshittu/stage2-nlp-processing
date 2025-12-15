@@ -63,6 +63,7 @@ RUN pip3 install PyYAML==6.0.1 httpx==0.26.0 aiohttp==3.9.1 \
 # Copy application code
 COPY src/ /app/src/
 COPY config/ /app/config/
+COPY tests/ /app/tests/
 
 RUN mkdir -p /app/logs /app/data
 
