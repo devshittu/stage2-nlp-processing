@@ -11,7 +11,7 @@ from typing import Dict, Any, List
 
 from src.core.celery_tasks import save_single_document
 from src.schemas.data_models import ProcessedDocument
-from src.storage.multi_backend_writer import MultiBackendWriter
+from src.storage.backends import MultiBackendWriter
 
 
 @pytest.fixture
