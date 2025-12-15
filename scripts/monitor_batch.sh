@@ -5,6 +5,23 @@
 #
 # If no job_id provided, uses the last submitted job
 #
+# Configuration:
+#   BATCH_SAVE_RESULTS=false       - Don't save results to files
+#   BATCH_DISPLAY_RESULTS=false    - Don't display results in terminal
+#   BATCH_OUTPUT_DIR=/custom/path  - Custom output directory
+#   BATCH_POLL_INTERVAL=60         - Custom polling interval (seconds)
+#
+# Examples:
+#   ./scripts/monitor_batch.sh                          # Normal mode (save + display)
+#   BATCH_SAVE_RESULTS=false ./scripts/monitor_batch.sh # Display only
+#   BATCH_DISPLAY_RESULTS=false ./scripts/monitor_batch.sh # Save only
+#
+
+# Get script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load configuration
+source "$SCRIPT_DIR/config.sh"
 
 # Colors for output
 RED='\033[0;31m'
@@ -35,8 +52,8 @@ echo -e "Job ID:     ${GREEN}$JOB_ID${NC}"
 echo -e "Started at: ${GREEN}$(date '+%Y-%m-%d %H:%M:%S')${NC}"
 echo ""
 
-# Poll interval in seconds
-POLL_INTERVAL=30
+# Poll interval in seconds (from config)
+POLL_INTERVAL=$BATCH_POLL_INTERVAL
 
 # Function to get checkpoint-based progress (more accurate than logs)
 get_checkpoint_progress() {
@@ -114,23 +131,24 @@ while true; do
         echo -e "Total documents: ${GREEN}$CURRENT_COUNT${NC}"
         echo ""
 
-        # Save final results
-        RESULTS_FILE="batch_results_${JOB_ID}.json"
-        echo "$RESPONSE" | jq '.' > "$RESULTS_FILE"
-        echo -e "${BLUE}Results saved to: ${GREEN}$RESULTS_FILE${NC}"
+        # Get results file path (empty if saving disabled)
+        RESULTS_FILE=$(get_results_file_path "$JOB_ID")
 
-        # Show results summary
-        echo ""
-        echo -e "${BLUE}Results Summary:${NC}"
-        echo "$RESPONSE" | jq '{
-            job_id,
-            status,
-            result: {
-                success_count: .result.success_count,
-                error_count: .result.error_count,
-                storylines: (.result.storylines | length)
-            }
-        }'
+        # Save and/or display results based on configuration
+        save_and_display_json \
+            "$RESPONSE" \
+            "$RESULTS_FILE" \
+            "Results" \
+            "Results Summary" \
+            '{
+                job_id,
+                status,
+                result: {
+                    success_count: .result.success_count,
+                    error_count: .result.error_count,
+                    storylines: (.result.storylines | length)
+                }
+            }'
 
         break
     elif [ "$STATUS" = "FAILURE" ]; then
@@ -147,10 +165,16 @@ while true; do
         echo -e "${RED}Error: $ERROR${NC}"
         echo ""
 
-        # Save error details
-        ERROR_FILE="batch_error_${JOB_ID}.json"
-        echo "$RESPONSE" | jq '.' > "$ERROR_FILE"
-        echo -e "${BLUE}Error details saved to: ${YELLOW}$ERROR_FILE${NC}"
+        # Get error file path (empty if saving disabled)
+        ERROR_FILE=$(get_error_file_path "$JOB_ID")
+
+        # Save and/or display error details based on configuration
+        save_and_display_json \
+            "$RESPONSE" \
+            "$ERROR_FILE" \
+            "Error details" \
+            "" \
+            '.'
 
         break
     fi

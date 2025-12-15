@@ -5,6 +5,22 @@
 #
 # Generates comprehensive metrics and analysis from batch processing logs
 #
+# Configuration:
+#   BATCH_SAVE_ANALYSIS=false      - Don't save analysis files
+#   BATCH_DISPLAY_ANALYSIS=false   - Don't display analysis in terminal
+#   BATCH_OUTPUT_DIR=/custom/path  - Custom output directory
+#
+# Examples:
+#   ./scripts/analyze_batch.sh                           # Normal mode (save + display)
+#   BATCH_SAVE_ANALYSIS=false ./scripts/analyze_batch.sh # Display only
+#   BATCH_DISPLAY_ANALYSIS=false ./scripts/analyze_batch.sh # Save only
+#
+
+# Get script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load configuration
+source "$SCRIPT_DIR/config.sh"
 
 # Colors for output
 RED='\033[0;31m'
@@ -27,14 +43,19 @@ else
     JOB_ID="$1"
 fi
 
-OUTPUT_DIR="batch_analysis_$(date +%Y%m%d_%H%M%S)"
+# Get analysis directory (configurable)
+OUTPUT_DIR=$(get_analysis_dir_path)
 mkdir -p "$OUTPUT_DIR"
 
 echo -e "${BLUE}======================================================================${NC}"
 echo -e "${BLUE}BATCH PROCESSING ANALYSIS${NC}"
 echo -e "${BLUE}======================================================================${NC}"
 echo -e "Job ID:      ${GREEN}$JOB_ID${NC}"
-echo -e "Output dir:  ${GREEN}$OUTPUT_DIR${NC}"
+if [ "$BATCH_SAVE_ANALYSIS" = "true" ]; then
+    echo -e "Output dir:  ${GREEN}$OUTPUT_DIR${NC}"
+else
+    echo -e "Mode:        ${YELLOW}Display only (not saving)${NC}"
+fi
 echo ""
 
 # Extract processed documents from logs
@@ -170,16 +191,25 @@ PYTHON_SCRIPT
 # Run Python analysis
 cd "$OUTPUT_DIR"
 python3 analyze.py > metrics_report.txt
-cat metrics_report.txt
+
+# Display or save based on configuration
+if [ "$BATCH_DISPLAY_ANALYSIS" = "true" ]; then
+    cat metrics_report.txt
+fi
 
 echo ""
 echo -e "${GREEN}======================================================================${NC}"
 echo -e "${GREEN}✓ ANALYSIS COMPLETE${NC}"
 echo -e "${GREEN}======================================================================${NC}"
 echo ""
-echo -e "${BLUE}Generated files in: ${GREEN}$OUTPUT_DIR${NC}"
-ls -lh "$OUTPUT_DIR"
 
-echo ""
-echo -e "${YELLOW}View full report:${NC} cat $OUTPUT_DIR/metrics_report.txt"
-echo -e "${YELLOW}View summary:${NC}     cat $OUTPUT_DIR/summary.json | jq"
+if [ "$BATCH_SAVE_ANALYSIS" = "true" ]; then
+    echo -e "${BLUE}Generated files in: ${GREEN}$OUTPUT_DIR${NC}"
+    ls -lh "$OUTPUT_DIR"
+    echo ""
+    echo -e "${YELLOW}View full report:${NC} cat $OUTPUT_DIR/metrics_report.txt"
+    echo -e "${YELLOW}View summary:${NC}     cat $OUTPUT_DIR/summary.json | jq"
+else
+    echo -e "${YELLOW}Analysis displayed above (not saved to disk)${NC}"
+    echo -e "${YELLOW}To save analysis, run with:${NC} BATCH_SAVE_ANALYSIS=true $0 $JOB_ID"
+fi
