@@ -28,6 +28,8 @@ from src.core.ner_logic import get_ner_model
 from src.schemas.data_models import Entity, NERServiceResponse
 from src.utils.config_manager import get_settings
 from src.utils.logger import get_logger, initialize_logging_from_config
+from src.core.resource_lifecycle_manager import get_resource_manager
+from src.core.cleanup_hooks import create_cleanup_hook
 
 
 # =============================================================================
@@ -73,6 +75,10 @@ class HealthStatus(BaseModel):
 # Global NER model instance
 _ner_model = None
 
+# Resource lifecycle manager
+_resource_manager = None
+_cleanup_hook = None
+
 
 def get_ner_model_instance():
     """Get or initialize NER model instance."""
@@ -104,6 +110,12 @@ async def lifespan(app: FastAPI):
     )
 
     try:
+        global _resource_manager, _cleanup_hook
+
+        # Initialize resource lifecycle manager
+        _resource_manager = get_resource_manager()
+        logger.info("Resource lifecycle manager initialized")
+
         # Pre-load model on startup
         model = get_ner_model_instance()
         model_info = model.get_model_info()
@@ -111,6 +123,16 @@ async def lifespan(app: FastAPI):
             "NER model loaded successfully at startup",
             extra={"model_info": model_info}
         )
+
+        # Register transformers cleanup hook
+        _cleanup_hook = create_cleanup_hook('transformers', model)
+        _resource_manager.register_cleanup_callback(
+            service_name='ner_service',
+            callback=_cleanup_hook.cleanup,
+            priority=50  # Medium priority
+        )
+        logger.info("Transformers cleanup hook registered")
+
     except Exception as e:
         logger.error(
             "Failed to load NER model at startup",
@@ -122,6 +144,10 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("NER service shutting down")
+
+    # Stop resource monitoring
+    if _resource_manager:
+        _resource_manager.stop_monitoring()
 
 
 # API Versioning Configuration
@@ -253,33 +279,35 @@ async def extract_entities(request: NERExtractRequest) -> NERExtractResponse:
         # Record start time
         start_time = time.time()
 
-        # Extract entities
-        model = get_ner_model_instance()
-        entities = model.extract_entities(
-            text=request.text,
-            document_id=request.document_id,
-            use_cache=True
-        )
+        # Track resource activity for this task
+        with _resource_manager.track_task("ner_service"):
+            # Extract entities
+            model = get_ner_model_instance()
+            entities = model.extract_entities(
+                text=request.text,
+                document_id=request.document_id,
+                use_cache=True
+            )
 
-        # Calculate processing time
-        processing_time_ms = (time.time() - start_time) * 1000
+            # Calculate processing time
+            processing_time_ms = (time.time() - start_time) * 1000
 
-        logger.info(
-            "Entities extracted successfully",
-            extra={
-                "document_id": request.document_id,
-                "entity_count": len(entities),
-                "text_length": len(request.text),
-                "processing_time_ms": round(processing_time_ms, 2)
-            }
-        )
+            logger.info(
+                "Entities extracted successfully",
+                extra={
+                    "document_id": request.document_id,
+                    "entity_count": len(entities),
+                    "text_length": len(request.text),
+                    "processing_time_ms": round(processing_time_ms, 2)
+                }
+            )
 
-        return NERExtractResponse(
-            document_id=request.document_id,
-            entities=entities,
-            processing_time_ms=round(processing_time_ms, 2),
-            model_name=config.ner_service.model_name
-        )
+            return NERExtractResponse(
+                document_id=request.document_id,
+                entities=entities,
+                processing_time_ms=round(processing_time_ms, 2),
+                model_name=config.ner_service.model_name
+            )
 
     except Exception as e:
         logger.error(
