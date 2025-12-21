@@ -29,6 +29,7 @@ import json
 import uuid
 import logging
 import traceback
+import time
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from collections import defaultdict
@@ -65,6 +66,7 @@ from src.schemas.data_models import (
 from src.core.event_linker import get_event_linker
 from src.storage.backends import MultiBackendWriter
 from src.core.checkpoint_manager import CheckpointManager, CheckpointStatus
+from src.core.resource_lifecycle_manager import get_resource_manager
 
 
 # =============================================================================
@@ -221,6 +223,26 @@ def on_worker_ready(sender, **kwargs):
 def on_worker_shutdown(sender, **kwargs):
     """Cleanup on worker shutdown."""
     logger.info("Worker shutting down...")
+
+    # Trigger resource cleanup for all services
+    try:
+        resource_manager = get_resource_manager()
+        logger.info("Performing resource cleanup on worker shutdown")
+
+        # Cleanup all services with aggressive strategy
+        for service_name in ['event_llm_service', 'ner_service', 'dp_service']:
+            result = resource_manager.cleanup_service(
+                service_name,
+                force=True  # Force cleanup regardless of idle state
+            )
+            logger.info(f"Cleanup result for {service_name}: {result}")
+
+        # Stop monitoring
+        resource_manager.stop_monitoring()
+        logger.info("Resource lifecycle manager stopped")
+
+    except Exception as e:
+        logger.error(f"Error during resource cleanup on shutdown: {e}", exc_info=True)
 
 
 # =============================================================================
@@ -1247,6 +1269,36 @@ def process_batch_task(
                 cluster.close()
             except Exception as e:
                 logger.warning(f"Error closing Dask cluster: {e}")
+
+        # Trigger resource cleanup after batch completion
+        try:
+            resource_manager = get_resource_manager()
+            logger.info("Triggering resource cleanup after batch completion")
+
+            # Get cleanup delay from config
+            cleanup_delay = settings.resource_lifecycle.task_completion.cleanup_delay_seconds
+
+            # Wait before cleanup to allow for potential burst requests
+            if cleanup_delay > 0:
+                import time
+                logger.debug(f"Waiting {cleanup_delay}s before cleanup (burst buffer)")
+                time.sleep(cleanup_delay)
+
+            # Trigger cleanup for all services
+            # Use balanced strategy by default (config-driven per service)
+            for service_name in ['event_llm_service', 'ner_service', 'dp_service']:
+                result = resource_manager.cleanup_service(
+                    service_name,
+                    force=False  # Respect idle timeout
+                )
+                if result.get("status") != "skipped":
+                    logger.info(
+                        f"Post-batch cleanup for {service_name}: "
+                        f"{', '.join(result.get('actions_performed', []))}"
+                    )
+
+        except Exception as e:
+            logger.error(f"Error during post-batch resource cleanup: {e}", exc_info=True)
 
 
 # =============================================================================
