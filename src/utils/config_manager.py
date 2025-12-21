@@ -346,6 +346,114 @@ class DevelopmentSettings(BaseModel):
     sample_data_path: str = Field(default="/app/data/sample_documents.jsonl")
 
 
+# =============================================================================
+# RESOURCE LIFECYCLE MANAGEMENT SETTINGS
+# =============================================================================
+
+class MemoryMonitoringSettings(BaseModel):
+    """Memory monitoring configuration."""
+    enabled: bool = Field(default=True)
+    check_interval_seconds: int = Field(default=30)
+    gpu_memory_threshold_percent: int = Field(default=85)
+    gpu_critical_threshold_percent: int = Field(default=95)
+    system_memory_threshold_percent: int = Field(default=80)
+    system_critical_threshold_percent: int = Field(default=90)
+
+
+class ServiceIdleTimeoutSettings(BaseModel):
+    """Idle timeout configuration for a service."""
+    enabled: bool = Field(default=True)
+    timeout_seconds: int = Field(default=600)
+    cleanup_strategy: str = Field(default="balanced")
+
+
+class CleanupStrategySettings(BaseModel):
+    """Cleanup strategy configuration."""
+    clear_gpu_cache: bool = Field(default=True)
+    unload_models: bool = Field(default=False)
+    clear_cpu_cache: bool = Field(default=True)
+    force_garbage_collection: bool = Field(default=True)
+    release_file_handles: bool = Field(default=True)
+    clear_tokenizer_cache: bool = Field(default=False)
+
+
+class VLLMHooksSettings(BaseModel):
+    """vLLM framework hook settings."""
+    enabled: bool = Field(default=True)
+    free_engine_on_idle: bool = Field(default=True)
+    clear_kv_cache: bool = Field(default=True)
+    release_worker_memory: bool = Field(default=True)
+
+
+class TransformersHooksSettings(BaseModel):
+    """Transformers framework hook settings."""
+    enabled: bool = Field(default=True)
+    move_model_to_cpu_on_idle: bool = Field(default=False)
+    clear_pipeline_cache: bool = Field(default=True)
+
+
+class SpacyHooksSettings(BaseModel):
+    """spaCy framework hook settings."""
+    enabled: bool = Field(default=True)
+    remove_pipes_on_idle: bool = Field(default=False)
+    clear_doc_cache: bool = Field(default=True)
+
+
+class FrameworkHooksSettings(BaseModel):
+    """Framework-specific cleanup hooks."""
+    vllm: VLLMHooksSettings = Field(default_factory=VLLMHooksSettings)
+    transformers: TransformersHooksSettings = Field(default_factory=TransformersHooksSettings)
+    spacy: SpacyHooksSettings = Field(default_factory=SpacyHooksSettings)
+
+
+class TaskCompletionSettings(BaseModel):
+    """Task completion detection settings."""
+    celery_hooks_enabled: bool = Field(default=True)
+    api_hooks_enabled: bool = Field(default=True)
+    batch_completion_cleanup: bool = Field(default=True)
+    cleanup_delay_seconds: int = Field(default=30)
+
+
+class ResourceLifecycleLoggingSettings(BaseModel):
+    """Logging configuration for resource lifecycle."""
+    enabled: bool = Field(default=True)
+    log_level: str = Field(default="INFO")
+    log_allocation_events: bool = Field(default=True)
+    log_peak_usage: bool = Field(default=True)
+    log_release_events: bool = Field(default=True)
+    log_memory_pressure: bool = Field(default=True)
+
+
+class ResourceLifecycleMetricsSettings(BaseModel):
+    """Metrics configuration for resource lifecycle."""
+    enabled: bool = Field(default=True)
+    track_vram_usage: bool = Field(default=True)
+    track_ram_usage: bool = Field(default=True)
+    track_cleanup_frequency: bool = Field(default=True)
+    track_idle_duration: bool = Field(default=True)
+    export_to_prometheus: bool = Field(default=True)
+
+
+class ErrorHandlingSettings(BaseModel):
+    """Error handling configuration."""
+    retry_on_failure: bool = Field(default=True)
+    max_retries: int = Field(default=3)
+    retry_delay_seconds: int = Field(default=5)
+
+
+class ResourceLifecycleSettings(BaseModel):
+    """Resource lifecycle management configuration."""
+    enabled: bool = Field(default=True)
+    memory_monitoring: MemoryMonitoringSettings = Field(default_factory=MemoryMonitoringSettings)
+    idle_timeouts: Dict[str, ServiceIdleTimeoutSettings] = Field(default_factory=dict)
+    cleanup_strategies: Dict[str, CleanupStrategySettings] = Field(default_factory=dict)
+    framework_hooks: FrameworkHooksSettings = Field(default_factory=FrameworkHooksSettings)
+    task_completion: TaskCompletionSettings = Field(default_factory=TaskCompletionSettings)
+    logging: ResourceLifecycleLoggingSettings = Field(default_factory=ResourceLifecycleLoggingSettings)
+    metrics: ResourceLifecycleMetricsSettings = Field(default_factory=ResourceLifecycleMetricsSettings)
+    error_handling: ErrorHandlingSettings = Field(default_factory=ErrorHandlingSettings)
+
+
 class Settings(BaseModel):
     """Root configuration model."""
     general: GeneralSettings = Field(default_factory=GeneralSettings)
@@ -361,6 +469,7 @@ class Settings(BaseModel):
     events: EventsConfig = Field(default_factory=EventsConfig)
     monitoring: MonitoringSettings = Field(default_factory=MonitoringSettings)
     development: DevelopmentSettings = Field(default_factory=DevelopmentSettings)
+    resource_lifecycle: ResourceLifecycleSettings = Field(default_factory=ResourceLifecycleSettings)
 
 
 # =============================================================================
