@@ -70,6 +70,7 @@ from src.utils.logger import get_logger, initialize_logging_from_config, Perform
 from src.utils.document_processor import get_document_processor
 from src.core.event_linker import get_event_linker
 from src.storage.backends import MultiBackendWriter
+from src.core.resource_lifecycle_manager import get_resource_manager
 
 
 # =============================================================================
@@ -689,6 +690,141 @@ async def health_check():
         timestamp=datetime.utcnow().isoformat() + "Z",
         version="1.0.0"
     )
+
+
+@app.get("/metrics/resources")  # Unversioned for backward compatibility
+@api_v1_router.get("/metrics/resources")  # Versioned endpoint
+async def get_resource_metrics():
+    """
+    Get resource lifecycle metrics and current usage statistics.
+
+    Returns detailed information about:
+    - GPU VRAM usage
+    - System RAM usage
+    - Service idle states
+    - Cleanup statistics
+    - Resource pressure indicators
+
+    Returns:
+        Dict with comprehensive resource metrics
+    """
+    try:
+        resource_manager = get_resource_manager()
+        metrics = resource_manager.get_metrics()
+
+        # Add timestamp
+        metrics["timestamp"] = datetime.utcnow().isoformat() + "Z"
+
+        # Calculate memory pressure status
+        gpu_percent = metrics.get("gpu_memory_percent", 0)
+        system_percent = metrics.get("system_memory_percent", 0)
+
+        if gpu_percent >= 95 or system_percent >= 90:
+            pressure_status = "critical"
+        elif gpu_percent >= 85 or system_percent >= 80:
+            pressure_status = "high"
+        elif gpu_percent >= 70 or system_percent >= 65:
+            pressure_status = "moderate"
+        else:
+            pressure_status = "normal"
+
+        metrics["memory_pressure_status"] = pressure_status
+
+        # Add recommendations if pressure is high
+        if pressure_status in ["high", "critical"]:
+            metrics["recommendations"] = [
+                "Consider triggering manual cleanup via cleanup endpoints",
+                "Review idle timeouts in settings.yaml",
+                "Monitor batch job sizes to prevent memory spikes"
+            ]
+
+        logger.debug(
+            "Resource metrics requested",
+            extra={
+                "gpu_usage": f"{gpu_percent:.1f}%",
+                "system_usage": f"{system_percent:.1f}%",
+                "pressure_status": pressure_status
+            }
+        )
+
+        return metrics
+
+    except Exception as e:
+        logger.error(f"Failed to get resource metrics: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve resource metrics: {str(e)}"
+        )
+
+
+@app.post("/admin/cleanup/{service_name}")  # Unversioned for backward compatibility
+@api_v1_router.post("/admin/cleanup/{service_name}")  # Versioned endpoint
+async def trigger_cleanup(
+    service_name: str,
+    force: bool = False,
+    strategy: Optional[str] = None
+):
+    """
+    Manually trigger resource cleanup for a specific service.
+
+    Args:
+        service_name: Service to cleanup (event_llm_service, ner_service, dp_service, orchestrator_service)
+        force: Force cleanup regardless of idle state (default: False)
+        strategy: Cleanup strategy override (aggressive, balanced, conservative)
+
+    Returns:
+        Dict with cleanup results
+    """
+    valid_services = ['event_llm_service', 'ner_service', 'dp_service', 'orchestrator_service']
+
+    if service_name not in valid_services:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid service name. Must be one of: {', '.join(valid_services)}"
+        )
+
+    valid_strategies = ['aggressive', 'balanced', 'conservative', None]
+    if strategy and strategy not in valid_strategies:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid strategy. Must be one of: aggressive, balanced, conservative"
+        )
+
+    try:
+        resource_manager = get_resource_manager()
+
+        from src.core.resource_lifecycle_manager import CleanupStrategy
+        strategy_enum = CleanupStrategy(strategy) if strategy else None
+
+        result = resource_manager.cleanup_service(
+            service_name=service_name,
+            strategy=strategy_enum,
+            force=force
+        )
+
+        logger.info(
+            f"Manual cleanup triggered for {service_name}",
+            extra={
+                "service": service_name,
+                "force": force,
+                "strategy": strategy,
+                "result": result
+            }
+        )
+
+        return {
+            "success": True,
+            "service": service_name,
+            "cleanup_result": result,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to trigger cleanup for {service_name}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to trigger cleanup: {str(e)}"
+        )
 
 
 @api_v1_router.post("/documents", response_model=ProcessDocumentResponse)
