@@ -115,6 +115,7 @@ services:
     environment:
       - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN}
       - CUDA_VISIBLE_DEVICES=${EVENT_LLM_GPU_ID:-0}  # Use env var or default to GPU 0
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # Reduce GPU memory fragmentation
     env_file:
       - .env
     volumes:
