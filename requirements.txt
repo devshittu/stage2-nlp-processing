@@ -101,6 +101,8 @@ auto-gptq==0.7.1
 
 # GPU Memory Management
 gputil==1.4.0
+pynvml==11.5.3  # NVIDIA Management Library (official GPU monitoring)
+psutil==6.1.0  # System and process utilities
 
 # Regex & Text Processing
 regex==2024.11.6
