@@ -32,6 +32,8 @@ from src.core.dp_logic import get_dependency_parser, DependencyParser
 from src.schemas.data_models import DPServiceResponse, SOATriplet, DependencyRelation
 from src.utils.config_manager import get_settings
 from src.utils.logger import setup_logging, get_logger
+from src.core.resource_lifecycle_manager import get_resource_manager
+from src.core.cleanup_hooks import create_cleanup_hook
 
 logger = get_logger(__name__, service="dp_service")
 
@@ -95,6 +97,10 @@ class ModelInfoResponse(BaseModel):
 
 parser: Optional[DependencyParser] = None
 
+# Resource lifecycle manager
+_resource_manager = None
+_cleanup_hook = None
+
 
 # =============================================================================
 # Lifespan Events
@@ -108,13 +114,28 @@ async def lifespan(app: FastAPI):
 
     Load model on startup, release on shutdown.
     """
-    global parser
+    global parser, _resource_manager, _cleanup_hook
 
     # Startup
     logger.info(f"Starting DP Service on port {dp_settings.port}")
     try:
+        # Initialize resource lifecycle manager
+        _resource_manager = get_resource_manager()
+        logger.info("Resource lifecycle manager initialized")
+
+        # Initialize parser
         parser = get_dependency_parser()
         logger.info("Dependency parser initialized successfully")
+
+        # Register spaCy cleanup hook
+        _cleanup_hook = create_cleanup_hook('spacy', parser)
+        _resource_manager.register_cleanup_callback(
+            service_name='dp_service',
+            callback=_cleanup_hook.cleanup,
+            priority=50  # Medium priority
+        )
+        logger.info("spaCy cleanup hook registered")
+
     except Exception as e:
         logger.error(f"Failed to initialize parser: {e}", exc_info=True)
         raise
@@ -123,6 +144,10 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down DP Service")
+
+    # Stop resource monitoring
+    if _resource_manager:
+        _resource_manager.stop_monitoring()
 
 
 # =============================================================================
@@ -211,29 +236,31 @@ async def parse(request: ParseRequest) -> ParseResponse:
                 f"Text exceeds maximum length of {settings.general.max_text_length} characters"
             )
 
-        # Parse text
-        soa_triplets, dependencies = parser.parse(request.text)
+        # Track resource activity for this task
+        with _resource_manager.track_task("dp_service"):
+            # Parse text
+            soa_triplets, dependencies = parser.parse(request.text)
 
-        processing_time_ms = (time.time() - start_time) * 1000
+            processing_time_ms = (time.time() - start_time) * 1000
 
-        logger.info(
-            "Text parsed successfully",
-            extra={
-                "document_id": request.document_id,
-                "text_length": len(request.text),
-                "triplets": len(soa_triplets),
-                "dependencies": len(dependencies),
-                "processing_time_ms": f"{processing_time_ms:.2f}"
-            }
-        )
+            logger.info(
+                "Text parsed successfully",
+                extra={
+                    "document_id": request.document_id,
+                    "text_length": len(request.text),
+                    "triplets": len(soa_triplets),
+                    "dependencies": len(dependencies),
+                    "processing_time_ms": f"{processing_time_ms:.2f}"
+                }
+            )
 
-        return ParseResponse(
-            document_id=request.document_id or "unknown",
-            soa_triplets=soa_triplets,
-            dependencies=dependencies if dependencies else None,
-            processing_time_ms=processing_time_ms,
-            model_name=dp_settings.model_name
-        )
+            return ParseResponse(
+                document_id=request.document_id or "unknown",
+                soa_triplets=soa_triplets,
+                dependencies=dependencies if dependencies else None,
+                processing_time_ms=processing_time_ms,
+                model_name=dp_settings.model_name
+            )
 
     except ValueError as e:
         logger.warning(f"Invalid input: {e}")
