@@ -87,42 +87,9 @@ class EventLLMModel:
         logger.info("Loading model with vLLM...")
 
         try:
-            # Build vLLM arguments conditionally
-            vllm_kwargs = {
-                "model": self.settings.model_name,
-                "tensor_parallel_size": self.settings.tensor_parallel_size,
-                "gpu_memory_utilization": self.settings.gpu_memory_utilization,
-                "max_model_len": self.settings.max_model_len,
-                "quantization": self.settings.quantization,
-                "dtype": self.settings.dtype,
-                "swap_space": self.settings.swap_space_gb,
-                "trust_remote_code": True,
-            }
-
-            # Try to add enable_prefix_caching if supported by this vLLM version
-            try:
-                from vllm import __version__ as vllm_version
-                # enable_prefix_caching is supported in vLLM >= 0.3.0
-                # but may have different names or be unsupported in some versions
-                # We'll try to add it and catch if it fails
-                import inspect
-                from vllm.entrypoints.llm import EngineArgs
-                if 'enable_prefix_caching' in inspect.signature(EngineArgs.__init__).parameters:
-                    vllm_kwargs["enable_prefix_caching"] = (
-                        self.settings.enable_prompt_cache
-                        if hasattr(self.settings, 'enable_prompt_cache')
-                        else True
-                    )
-                    logger.debug("enable_prefix_caching parameter is supported")
-                else:
-                    logger.debug("enable_prefix_caching parameter not supported in this vLLM version")
-            except Exception as param_check_error:
-                logger.debug(f"Could not check for enable_prefix_caching support: {param_check_error}")
-
-            self.model = LLM(**vllm_kwargs)
-
-            # Load tokenizer separately for chunking
-            # Try fast tokenizer first, fall back to slow tokenizer if needed
+            # Load tokenizer first and configure it properly
+            # This must be done before vLLM initialization to avoid tokenizer issues
+            logger.info("Loading and configuring tokenizer...")
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     self.settings.model_name,
@@ -134,6 +101,56 @@ class EventLLMModel:
                     self.settings.model_name,
                     use_fast=False
                 )
+
+            # Configure tokenizer to avoid vLLM generation hang
+            # Mistral models don't have a default pad_token, which causes vLLM to hang
+            if self.tokenizer.pad_token is None:
+                if self.tokenizer.eos_token is not None:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+                    self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+                    logger.info(f"Set pad_token to eos_token: {self.tokenizer.eos_token}")
+                else:
+                    # Fallback: use a special token or add a new one
+                    self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                    logger.info("Added new pad_token: [PAD]")
+
+            logger.info(
+                "Tokenizer configured",
+                extra={
+                    "vocab_size": len(self.tokenizer),
+                    "pad_token": self.tokenizer.pad_token,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "eos_token": self.tokenizer.eos_token,
+                    "eos_token_id": self.tokenizer.eos_token_id
+                }
+            )
+
+            # Build vLLM arguments conditionally
+            # Disable prefix caching to prevent potential hangs with resource lifecycle
+            vllm_kwargs = {
+                "model": self.settings.model_name,
+                "tensor_parallel_size": self.settings.tensor_parallel_size,
+                "gpu_memory_utilization": self.settings.gpu_memory_utilization,
+                "max_model_len": self.settings.max_model_len,
+                "quantization": self.settings.quantization,
+                "dtype": self.settings.dtype,
+                "swap_space": self.settings.swap_space_gb,
+                "trust_remote_code": True,
+                "disable_log_stats": False,  # Keep logging for debugging
+            }
+
+            # Explicitly disable prefix caching to avoid conflicts with resource lifecycle
+            try:
+                import inspect
+                from vllm.entrypoints.llm import EngineArgs
+                if 'enable_prefix_caching' in inspect.signature(EngineArgs.__init__).parameters:
+                    vllm_kwargs["enable_prefix_caching"] = False
+                    logger.info("Prefix caching explicitly disabled to prevent hang")
+            except Exception as param_check_error:
+                logger.debug(f"Could not check for enable_prefix_caching support: {param_check_error}")
+
+            logger.info("Initializing vLLM engine...")
+            self.model = LLM(**vllm_kwargs)
 
             logger.info("vLLM model loaded successfully")
 
@@ -316,16 +333,24 @@ class EventLLMModel:
 
     def _generate_vllm(self, prompt: str) -> str:
         """Generate with vLLM."""
+        # Configure sampling parameters with safeguards against hangs
         sampling_params = SamplingParams(
             temperature=self.settings.temperature,
             top_p=self.settings.top_p,
             top_k=self.settings.top_k,
             max_tokens=self.settings.max_new_tokens,
-            stop=["```", "\n\n\n"]  # Stop tokens
+            stop=None,  # Disable stop tokens to prevent hang issues
+            skip_special_tokens=True,  # Skip special tokens in output
+            logprobs=None,  # Disable logprobs for faster generation
         )
 
+        logger.debug(f"Generating with vLLM (max_tokens={self.settings.max_new_tokens})")
         outputs = self.model.generate([prompt], sampling_params)
-        return outputs[0].outputs[0].text
+
+        generated_text = outputs[0].outputs[0].text
+        logger.debug(f"Generated {len(generated_text)} characters")
+
+        return generated_text
 
     def _generate_hf(self, prompt: str) -> str:
         """Generate with HuggingFace transformers."""
@@ -458,15 +483,18 @@ class EventLLMModel:
             for text, ctx, domain in zip(texts, contexts, domain_hints)
         ]
 
-        # Generate in batch
+        # Generate in batch with safeguards against hangs
         sampling_params = SamplingParams(
             temperature=self.settings.temperature,
             top_p=self.settings.top_p,
             top_k=self.settings.top_k,
             max_tokens=self.settings.max_new_tokens,
-            stop=["```", "\n\n\n"]
+            stop=None,  # Disable stop tokens to prevent hang issues
+            skip_special_tokens=True,  # Skip special tokens in output
+            logprobs=None,  # Disable logprobs for faster generation
         )
 
+        logger.debug(f"Batch generating for {len(prompts)} documents")
         outputs = self.model.generate(prompts, sampling_params)
 
         # Parse outputs
