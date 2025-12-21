@@ -134,8 +134,8 @@ event_llm_service:
   # vLLM settings for optimized inference
   use_vllm: true
   tensor_parallel_size: 1  # Set to number of GPUs (1 for single RTX A4000)
-  gpu_memory_utilization: 0.95  # Use 95% of 16GB VRAM (increased from 0.90)
-  max_model_len: 4096  # Maximum context length (reduced from 8192 to fit in VRAM)
+  gpu_memory_utilization: 0.95  # Use 95% of 16GB VRAM
+  max_model_len: 1024  # Maximum context length (reduced to fit KV cache constraints)
 
   # Quantization for memory efficiency
   quantization: null  # Options: "awq", "gptq", null for no quantization
@@ -386,6 +386,148 @@ caching:
   # Prompt cache for LLM (vLLM supports this natively)
   enable_prompt_cache: true
   prompt_cache_size_mb: 2048  # 2GB for cached prompts
+
+# =============================================================================
+# RESOURCE LIFECYCLE MANAGEMENT
+# =============================================================================
+resource_lifecycle:
+  # Global enable/disable for intelligent resource cleanup
+  enabled: true  # Re-enabled after fixing vLLM generation hang
+
+  # Memory pressure monitoring
+  memory_monitoring:
+    enabled: true
+    check_interval_seconds: 30  # How often to check memory usage
+
+    # GPU VRAM thresholds (set above vLLM's 85% utilization to avoid conflicts)
+    gpu_memory_threshold_percent: 92  # Trigger cleanup at 92% VRAM usage
+    gpu_critical_threshold_percent: 97  # Critical level - aggressive cleanup
+
+    # System RAM thresholds
+    system_memory_threshold_percent: 80
+    system_critical_threshold_percent: 90
+
+  # Idle timeout configuration per service
+  idle_timeouts:
+    # Event LLM service - highest VRAM footprint, more aggressive cleanup
+    event_llm_service:
+      enabled: true
+      timeout_seconds: 600  # 10 minutes
+      cleanup_strategy: "aggressive"  # aggressive, balanced, conservative
+
+    # NER service - CPU-based, conservative cleanup
+    ner_service:
+      enabled: true
+      timeout_seconds: 900  # 15 minutes
+      cleanup_strategy: "balanced"
+
+    # DP service - CPU-based, conservative cleanup
+    dp_service:
+      enabled: true
+      timeout_seconds: 900  # 15 minutes
+      cleanup_strategy: "balanced"
+
+    # Orchestrator - keep alive, only cleanup ephemeral task resources
+    orchestrator_service:
+      enabled: true
+      timeout_seconds: 1800  # 30 minutes
+      cleanup_strategy: "conservative"
+
+  # Cleanup strategies define what gets released
+  cleanup_strategies:
+    aggressive:
+      # Release everything except core infrastructure
+      clear_gpu_cache: true
+      unload_models: true
+      clear_cpu_cache: true
+      force_garbage_collection: true
+      release_file_handles: true
+      clear_tokenizer_cache: true
+
+    balanced:
+      # Keep commonly used assets, release task-specific resources
+      clear_gpu_cache: true
+      unload_models: false  # Keep models loaded
+      clear_cpu_cache: true
+      force_garbage_collection: true
+      release_file_handles: true
+      clear_tokenizer_cache: false
+
+    conservative:
+      # Minimal cleanup - only clear task-specific ephemeral resources
+      clear_gpu_cache: false
+      unload_models: false
+      clear_cpu_cache: false
+      force_garbage_collection: true
+      release_file_handles: true
+      clear_tokenizer_cache: false
+
+  # Framework-specific cleanup hooks
+  framework_hooks:
+    # vLLM (Event LLM service)
+    vllm:
+      enabled: true
+      free_engine_on_idle: true
+      clear_kv_cache: true
+      release_worker_memory: true
+
+    # Transformers (NER service)
+    transformers:
+      enabled: true
+      move_model_to_cpu_on_idle: false  # NER already on CPU
+      clear_pipeline_cache: true
+
+    # spaCy (DP service)
+    spacy:
+      enabled: true
+      remove_pipes_on_idle: false
+      clear_doc_cache: true
+
+  # Task completion detection
+  task_completion:
+    # Hook into Celery task lifecycle
+    celery_hooks_enabled: true
+
+    # Hook into API endpoint completion
+    api_hooks_enabled: true
+
+    # Detect batch job completion
+    batch_completion_cleanup: true
+
+    # Delay before cleanup (allow for burst requests)
+    cleanup_delay_seconds: 30
+
+  # Observability
+  logging:
+    enabled: true
+    log_level: "INFO"  # DEBUG for detailed resource tracking
+    log_allocation_events: true
+    log_peak_usage: true
+    log_release_events: true
+    log_memory_pressure: true
+
+  # Metrics for monitoring dashboards
+  metrics:
+    enabled: true
+    track_vram_usage: true
+    track_ram_usage: true
+    track_cleanup_frequency: true
+    track_idle_duration: true
+    export_to_prometheus: true
+
+  # Error handling
+  error_handling:
+    # Retry cleanup on failure
+    retry_on_failure: true
+    max_retries: 3
+    retry_delay_seconds: 5
+
+    # Prevent partial releases
+    atomic_cleanup: true
+
+    # Orphaned resource detection
+    detect_orphaned_resources: true
+    orphan_scan_interval_seconds: 300  # 5 minutes
 
 # =============================================================================
 # INTER-STAGE COMMUNICATION (Event Publishing)
