@@ -26,6 +26,8 @@ from src.core.event_llm_logic import get_event_llm_model
 from src.schemas.data_models import Event, EventLLMServiceResponse
 from src.utils.config_manager import get_settings
 from src.utils.logger import get_logger, initialize_logging_from_config
+from src.core.resource_lifecycle_manager import get_resource_manager
+from src.core.cleanup_hooks import create_cleanup_hook
 
 
 # =============================================================================
@@ -93,6 +95,10 @@ class ErrorResponse(BaseModel):
 # Global model instance
 _model_instance = None
 
+# Resource lifecycle manager
+_resource_manager = None
+_cleanup_hook = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -103,7 +109,13 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Event LLM Service starting up")
     try:
-        global _model_instance
+        global _model_instance, _resource_manager, _cleanup_hook
+
+        # Initialize resource lifecycle manager
+        _resource_manager = get_resource_manager()
+        logger.info("Resource lifecycle manager initialized")
+
+        # Load Event LLM model
         _model_instance = get_event_llm_model()
         logger.info(
             "Event LLM model loaded successfully",
@@ -112,6 +124,16 @@ async def lifespan(app: FastAPI):
                 "use_vllm": _model_instance.use_vllm
             }
         )
+
+        # Register vLLM cleanup hook
+        _cleanup_hook = create_cleanup_hook('vllm', _model_instance)
+        _resource_manager.register_cleanup_callback(
+            service_name='event_llm_service',
+            callback=_cleanup_hook.cleanup,
+            priority=100  # High priority for GPU cleanup
+        )
+        logger.info("vLLM cleanup hook registered")
+
     except Exception as e:
         logger.error("Failed to load Event LLM model during startup", exc_info=True)
         raise
@@ -120,6 +142,10 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Event LLM Service shutting down")
+
+    # Stop resource monitoring
+    if _resource_manager:
+        _resource_manager.stop_monitoring()
 
 
 # API Versioning Configuration
@@ -237,40 +263,42 @@ async def extract_events(request: ExtractEventRequest):
                 detail="Event LLM model not loaded. Service starting up."
             )
 
-        # Extract events (entities can be used for context enrichment if needed)
-        events: List[Event] = _model_instance.extract_events(
-            text=request.text,
-            document_id=document_id,
-            context=request.context,
-            domain_hint=request.domain_hint
-        )
+        # Track resource activity for this task
+        with _resource_manager.track_task("event_llm_service"):
+            # Extract events (entities can be used for context enrichment if needed)
+            events: List[Event] = _model_instance.extract_events(
+                text=request.text,
+                document_id=document_id,
+                context=request.context,
+                domain_hint=request.domain_hint
+            )
 
-        # Note: entities parameter is available in request.entities if needed for future enhancements
+            # Note: entities parameter is available in request.entities if needed for future enhancements
 
-        # Calculate chunks processed
-        chunks = _model_instance.chunk_text(request.text)
-        chunks_processed = len(chunks)
+            # Calculate chunks processed
+            chunks = _model_instance.chunk_text(request.text)
+            chunks_processed = len(chunks)
 
-        # Calculate processing time
-        processing_time_ms = (time.time() - start_time) * 1000
+            # Calculate processing time
+            processing_time_ms = (time.time() - start_time) * 1000
 
-        logger.info(
-            f"Successfully extracted {len(events)} events from {chunks_processed} chunks",
-            extra={
-                "document_id": document_id,
-                "event_count": len(events),
-                "chunks_processed": chunks_processed,
-                "processing_time_ms": round(processing_time_ms, 2)
-            }
-        )
+            logger.info(
+                f"Successfully extracted {len(events)} events from {chunks_processed} chunks",
+                extra={
+                    "document_id": document_id,
+                    "event_count": len(events),
+                    "chunks_processed": chunks_processed,
+                    "processing_time_ms": round(processing_time_ms, 2)
+                }
+            )
 
-        return EventLLMServiceResponse(
-            document_id=document_id,
-            events=events,
-            processing_time_ms=round(processing_time_ms, 2),
-            model_name=_model_instance.settings.model_name,
-            chunks_processed=chunks_processed
-        )
+            return EventLLMServiceResponse(
+                document_id=document_id,
+                events=events,
+                processing_time_ms=round(processing_time_ms, 2),
+                model_name=_model_instance.settings.model_name,
+                chunks_processed=chunks_processed
+            )
 
     except HTTPException:
         raise
