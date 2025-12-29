@@ -82,3 +82,8 @@ batch_analysis_*/
 /tmp/batch_*.json
 /tmp/last_batch_job_id.txt
 
+
+# Gemini
+.gemini/
+.claude/
+.context/
