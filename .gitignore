@@ -87,3 +87,8 @@ batch_analysis_*/
 .gemini/
 .claude/
 .context/
+
+# Shared metadata registry (temporary copy from infrastructure, created by run-with-infrastructure.sh)
+# Keep the directory (for Docker COPY) but ignore all contents except .gitkeep
+.shared-metadata-registry/*
+!.shared-metadata-registry/.gitkeep
