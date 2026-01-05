@@ -60,6 +60,17 @@ RUN pip3 install PyYAML==6.0.1 httpx==0.26.0 aiohttp==3.9.1 \
     click==8.1.7 rich==13.7.0 python-dateutil==2.8.2 \
     python-multipart==0.0.6 python-dotenv==1.0.0 ujson==5.9.0 tqdm==4.66.1
 
+# Install shared-metadata-registry (infrastructure integration)
+# This directory is created by run-with-infrastructure.sh when using infrastructure mode
+# For standalone mode, this will just skip the installation
+COPY .shared-metadata-registry /tmp/shared-metadata-registry
+RUN if [ -d /tmp/shared-metadata-registry ] && [ "$(ls -A /tmp/shared-metadata-registry)" ]; then \
+        echo "Installing shared-metadata-registry..."; \
+        pip3 install -e /tmp/shared-metadata-registry; \
+    else \
+        echo "Skipping shared-metadata-registry (not in infrastructure mode)"; \
+    fi
+
 # Copy application code
 COPY src/ /app/src/
 COPY config/ /app/config/
