@@ -8,12 +8,15 @@ This is a DUAL-WRITE pattern: existing storage backends continue to work unchang
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from uuid import UUID
 
 import structlog
 
 # Import shared metadata registry
+if TYPE_CHECKING:
+    from shared_metadata_registry import RegistryConfig
+
 try:
     from shared_metadata_registry import (
         DocumentMetadata,
@@ -29,6 +32,15 @@ try:
     REGISTRY_AVAILABLE = True
 except ImportError:
     REGISTRY_AVAILABLE = False
+    # Define all types as None when import fails to prevent NameError
+    DocumentMetadata = None
+    EntityMetadata = None
+    EventMetadata = None
+    JobRegistration = None
+    JobStatus = None
+    MetadataRegistry = None
+    RegistryConfig = None
+    StorylineMetadata = None
     structlog.get_logger(__name__).warning(
         "shared_metadata_registry not installed - metadata registry disabled"
     )
