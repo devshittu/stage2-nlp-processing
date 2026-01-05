@@ -454,6 +454,38 @@ class ResourceLifecycleSettings(BaseModel):
     error_handling: ErrorHandlingSettings = Field(default_factory=ErrorHandlingSettings)
 
 
+class EventConsumerSettings(BaseModel):
+    """Event consumer configuration (Stage 1 → Stage 2 integration)."""
+    enabled: bool = Field(default=False, description="Enable/disable event consumption from Stage 1")
+    source_stream: str = Field(default="stage1:cleaning:events", description="Source Redis stream")
+    redis_host: str = Field(default="redis-cache", description="Redis host")
+    redis_port: int = Field(default=6379, description="Redis port")
+    redis_db: int = Field(default=1, description="Redis database number")
+    consumer_group: str = Field(default="stage2-nlp-processor", description="Consumer group name")
+    consumer_name: str = Field(default="${HOSTNAME}", description="Consumer instance name")
+    consume_events: List[str] = Field(
+        default_factory=lambda: [
+            "com.storytelling.cleaning.document.cleaned",
+            "com.storytelling.cleaning.job.completed"
+        ],
+        description="Event types to consume"
+    )
+    auto_process: bool = Field(default=True, description="Automatically trigger NLP processing")
+    batch_mode: bool = Field(default=True, description="Process job.completed as batches")
+    poll_interval_ms: int = Field(default=1000, description="Polling interval in milliseconds")
+    batch_size: int = Field(default=10, description="Events per iteration")
+    concurrent_tasks: int = Field(default=4, description="Parallel processing tasks")
+    retry_failed: bool = Field(default=True, description="Retry failed events")
+    max_retries: int = Field(default=3, description="Maximum retry attempts")
+    retry_delay_seconds: int = Field(default=5, description="Delay between retries")
+    dead_letter_stream: str = Field(default="stage2:nlp:failed-events", description="Failed events stream")
+    check_already_processed: bool = Field(default=True, description="Check for duplicates")
+    deduplication_ttl_hours: int = Field(default=24, description="Deduplication TTL in hours")
+    process_backlog: bool = Field(default=True, description="Process historical events on startup")
+    backlog_batch_size: int = Field(default=100, description="Backlog batch size")
+    backlog_max_age_hours: int = Field(default=72, description="Max age for backlog events")
+
+
 class Settings(BaseModel):
     """Root configuration model."""
     general: GeneralSettings = Field(default_factory=GeneralSettings)
@@ -467,6 +499,7 @@ class Settings(BaseModel):
     storage: StorageSettings = Field(default_factory=StorageSettings)
     caching: CachingSettings = Field(default_factory=CachingSettings)
     events: EventsConfig = Field(default_factory=EventsConfig)
+    event_consumer: EventConsumerSettings = Field(default_factory=EventConsumerSettings)
     monitoring: MonitoringSettings = Field(default_factory=MonitoringSettings)
     development: DevelopmentSettings = Field(default_factory=DevelopmentSettings)
     resource_lifecycle: ResourceLifecycleSettings = Field(default_factory=ResourceLifecycleSettings)
