@@ -68,6 +68,19 @@ from src.storage.backends import MultiBackendWriter
 from src.core.checkpoint_manager import CheckpointManager, CheckpointStatus
 from src.core.resource_lifecycle_manager import get_resource_manager
 
+# Metadata registry integration (optional, graceful degradation if unavailable)
+try:
+    from src.storage.metadata_integration import (
+        sync_write_job_to_registry,
+        sync_write_documents_to_registry,
+        update_job_status_in_registry,
+    )
+    METADATA_REGISTRY_AVAILABLE = True
+except ImportError:
+    METADATA_REGISTRY_AVAILABLE = False
+    # Note: logger not defined yet at this point, will log after initialization
+    pass
+
 
 # =============================================================================
 # Module Initialization
@@ -76,6 +89,10 @@ from src.core.resource_lifecycle_manager import get_resource_manager
 # Initialize logging
 initialize_logging_from_config()
 logger = get_logger(__name__, service="celery_worker")
+
+# Log metadata registry availability
+if not METADATA_REGISTRY_AVAILABLE:
+    logger.warning("Metadata registry integration not available - continuing without")
 
 # Load settings
 settings = get_settings()
@@ -621,6 +638,17 @@ def save_processed_documents(
             extra={"save_results": save_results}
         )
 
+        # Write to metadata registry (dual-write pattern)
+        if METADATA_REGISTRY_AVAILABLE:
+            try:
+                registry_count = sync_write_documents_to_registry(processed_docs)
+                logger.info(
+                    f"Metadata registry: wrote {registry_count}/{len(processed_docs)} documents"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to write to metadata registry: {e}")
+                # Continue - registry failure doesn't stop pipeline
+
         return {
             "documents_saved": len(processed_docs),
             "backend_results": save_results
@@ -862,6 +890,24 @@ def process_batch_task(
 
     # Initialize checkpoint manager for progressive saving and pause/resume
     checkpoint_mgr = CheckpointManager()
+
+    # Register job in metadata registry (dual-write pattern)
+    if METADATA_REGISTRY_AVAILABLE:
+        try:
+            from uuid import UUID
+            job_uuid = UUID(task_id) if isinstance(task_id, str) else task_id
+            sync_write_job_to_registry(
+                job_id=job_uuid,
+                batch_id=batch_id,
+                metadata={"stage": 2, "stage_name": "nlp"}
+            )
+            logger.info(
+                "job_registered_in_metadata_registry",
+                extra={"job_id": str(task_id), "batch_id": batch_id}
+            )
+        except Exception as e:
+            logger.warning(f"Failed to register job in metadata registry: {e}")
+            # Continue processing - registry failure doesn't stop pipeline
 
     try:
         # Validate documents input
@@ -1226,6 +1272,19 @@ def process_batch_task(
         checkpoint_mgr.complete(task_id)
         logger.info(f"Batch processing completed, checkpoint finalized")
 
+        # Update job status in metadata registry
+        if METADATA_REGISTRY_AVAILABLE:
+            try:
+                from uuid import UUID
+                job_uuid = UUID(task_id) if isinstance(task_id, str) else task_id
+                update_job_status_in_registry(
+                    job_id=job_uuid,
+                    status="completed"
+                )
+                logger.info("job_status_updated_to_completed", extra={"job_id": str(task_id)})
+            except Exception as e:
+                logger.warning(f"Failed to update job status to completed: {e}")
+
         return result
 
     except Exception as e:
@@ -1240,11 +1299,28 @@ def process_batch_task(
         # Mark checkpoint as failed (unless paused/stopped intentionally)
         if "paused by user" in str(e).lower():
             logger.info("Batch paused, checkpoint retained for resume")
+            job_status = "paused"
         elif "stopped by user" in str(e).lower():
             logger.info("Batch stopped, checkpoint retained")
+            job_status = "cancelled"
         else:
             checkpoint_mgr.update_checkpoint(task_id, status=CheckpointStatus.FAILED)
             logger.error("Batch failed, checkpoint marked as failed")
+            job_status = "failed"
+
+        # Update job status in metadata registry
+        if METADATA_REGISTRY_AVAILABLE:
+            try:
+                from uuid import UUID
+                job_uuid = UUID(task_id) if isinstance(task_id, str) else task_id
+                update_job_status_in_registry(
+                    job_id=job_uuid,
+                    status=job_status,
+                    error_message=error_msg if job_status == "failed" else None
+                )
+                logger.info(f"job_status_updated_to_{job_status}", extra={"job_id": str(task_id)})
+            except Exception as ex:
+                logger.warning(f"Failed to update job status to {job_status}: {ex}")
 
         return {
             "success": False,
