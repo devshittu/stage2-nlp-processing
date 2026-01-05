@@ -610,6 +610,53 @@ events:
     log_level: "INFO"  # DEBUG for detailed event payloads
 
 # =============================================================================
+# EVENT CONSUMER (Stage 1 → Stage 2 Integration)
+# =============================================================================
+event_consumer:
+  # Enable/disable event consumption from Stage 1
+  enabled: true  # ✅ ENABLED BY DEFAULT
+
+  # Source stream configuration (Stage 1 CloudEvents)
+  source_stream: "stage1:cleaning:events"
+  redis_host: "redis-cache"
+  redis_port: 6379
+  redis_db: 1  # Stage 1 publishes to DB 1
+
+  # Consumer group settings (fault-tolerant consumption)
+  consumer_group: "stage2-nlp-processor"
+  consumer_name: "${HOSTNAME}"  # Unique per worker instance
+
+  # Event filtering - specify which event types to consume
+  # If not set or empty, consumes all event types
+  consume_events:
+    - "com.storytelling.cleaning.document.cleaned"
+    - "com.storytelling.cleaning.job.completed"
+
+  # Processing behavior
+  auto_process: true  # Automatically trigger NLP processing
+  batch_mode: true    # Process job.completed events as batches
+
+  # Performance tuning
+  poll_interval_ms: 1000  # Check for new events every 1 second
+  batch_size: 10          # Process up to 10 events per iteration
+  concurrent_tasks: 4     # Number of parallel processing tasks
+
+  # Error handling and retry logic
+  retry_failed: true
+  max_retries: 3
+  retry_delay_seconds: 5
+  dead_letter_stream: "stage2:nlp:failed-events"
+
+  # Idempotency - prevent duplicate processing
+  check_already_processed: true
+  deduplication_ttl_hours: 24
+
+  # Backlog processing (historical events)
+  process_backlog: true  # ✅ ENABLED - Process 350 existing events on startup
+  backlog_batch_size: 100
+  backlog_max_age_hours: 72  # Process events < 72h old (to capture all existing)
+
+# =============================================================================
 # MONITORING & OBSERVABILITY
 # =============================================================================
 monitoring:
