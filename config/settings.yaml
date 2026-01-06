@@ -332,11 +332,21 @@ storage:
     # - "postgresql"
     # - "elasticsearch"
 
+  # Base data directory structure
+  data_directories:
+    base: "/app/data"
+    input: "/app/data/input"           # Input files (JSONL from Stage 1)
+    output: "/app/data/output"         # Processed output files (timestamped)
+    checkpoints: "/app/data/checkpoints"  # Checkpoint files for batch processing
+    batch_results: "/app/data/batch_results"  # Batch job result metadata
+
   # JSONL storage configuration
   jsonl:
-    output_directory: "/app/data"
+    output_directory: "/app/data/output"  # Outputs go to structured output/ subdirectory
     file_prefix: "extracted_events"
-    use_daily_files: true  # Creates separate file per day
+    # Timestamp format: "datetime" (YYYY-MM-DD_HH-MM-SS), "date" (YYYY-MM-DD), or "none"
+    timestamp_format: "datetime"  # Human-readable datetime stamps for all outputs
+    use_daily_files: false  # Deprecated: use timestamp_format instead
     compression: null  # Options: "gzip", "bz2", null
     append_mode: true
 

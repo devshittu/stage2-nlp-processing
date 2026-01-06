@@ -763,7 +763,7 @@ def process_document_task(self, document_json: str) -> Dict[str, Any]:
         )
 
         # Use HTTP requests to microservices (no model loading needed)
-        storage_writer = MultiBackendWriter()
+        storage_writer = MultiBackendWriter(job_id=task_id)
 
         # Process document via HTTP
         result = process_single_document_pipeline(
@@ -954,7 +954,7 @@ def process_batch_task(
 
         # Use cached models (loaded once per worker)
         logger.info("Using cached NLP models")
-        storage_writer = MultiBackendWriter()
+        storage_writer = MultiBackendWriter(job_id=task_id)
 
         # Create or load checkpoint for progressive saving and resume capability
         checkpoint = checkpoint_mgr.load_checkpoint(task_id)
@@ -1238,11 +1238,12 @@ def process_batch_task(
         # Publish batch.completed event
         if event_publisher and settings.events.enabled and settings.events.publish_events.batch_completed:
             try:
-                # Determine output locations
+                # Determine output locations (use new structured output directory)
                 output_locations = {}
                 if save_stats:
                     if save_stats.get("jsonl"):
-                        output_locations["jsonl"] = f"file:///app/data/extracted_events_{datetime.utcnow().strftime('%Y-%m-%d')}.jsonl"
+                        # Use new timestamped output format: YYYY-MM-DD_HH-MM-SS
+                        output_locations["jsonl"] = f"file:///app/data/output/extracted_events_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}.jsonl"
                     if save_stats.get("postgresql"):
                         output_locations["postgresql"] = f"postgresql://db/batch/{batch_id}"
                     if save_stats.get("elasticsearch"):

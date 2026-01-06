@@ -61,13 +61,27 @@ class CheckpointManager:
     - Quick status checks
     """
 
-    def __init__(self, checkpoint_dir: str = "/app/data/checkpoints"):
+    def __init__(self, checkpoint_dir: Optional[str] = None):
         """
         Initialize checkpoint manager.
 
         Args:
-            checkpoint_dir: Directory to store checkpoint files
+            checkpoint_dir: Directory to store checkpoint files.
+                           If None, uses path from settings.yaml.
         """
+        if checkpoint_dir is None:
+            # Load from settings if available
+            try:
+                from src.utils.config_manager import get_settings
+                settings = get_settings()
+                checkpoint_dir = getattr(
+                    settings.storage.data_directories,
+                    'checkpoints',
+                    '/app/data/checkpoints'
+                )
+            except Exception:
+                checkpoint_dir = '/app/data/checkpoints'
+
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 

@@ -26,7 +26,18 @@ docker-compose.override.yml
 *.dockerignore
 
 # Generated data and model files
-data/
+# All data directories are ignored (test files live outside VCS)
+data/output/
+data/checkpoints/
+data/batch_results/
+data/input/
+# Ignore legacy flat files in data root (pre-refactor)
+data/*.jsonl
+data/batch_outputs/
+data/raw/
+data/processed/
+
+# Models and caches
 models/
 model_cache/
 .model_cache/
