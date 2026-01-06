@@ -4,7 +4,8 @@
 # Usage: ./scripts/submit_batch.sh <input_file.jsonl> [batch_id]
 #
 # Example:
-#   ./scripts/submit_batch.sh data/processed_articles_2025-10-20.jsonl batch_2025-10-20
+#   ./scripts/submit_batch.sh data/input/valid_test.jsonl batch_test
+#   ./scripts/submit_batch.sh data/input/sample_stage1_documents.jsonl batch_2025-01-06
 #
 
 set -e
@@ -22,7 +23,7 @@ if [ $# -lt 1 ]; then
     echo "Usage: $0 <input_file.jsonl> [batch_id]"
     echo ""
     echo "Example:"
-    echo "  $0 data/processed_articles_2025-10-20.jsonl batch_2025-10-20"
+    echo "  $0 data/input/valid_test.jsonl batch_test"
     exit 1
 fi
 
