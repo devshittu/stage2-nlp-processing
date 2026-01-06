@@ -72,29 +72,70 @@ class StorageBackend(ABC):
 
 class JSONLBackend(StorageBackend):
     """
-    JSONL file storage backend with daily rotation.
+    JSONL file storage backend with timestamped output files.
 
-    Creates files like: extracted_events_2025-01-15.jsonl
+    Creates files like: extracted_events_2025-01-15_14-30-45.jsonl
+    Human-readable format: YYYY-MM-DD_HH-MM-SS
     """
 
-    def __init__(self):
-        """Initialize JSONL backend."""
+    def __init__(self, job_id: Optional[str] = None):
+        """
+        Initialize JSONL backend.
+
+        Args:
+            job_id: Optional job ID to include in filename for batch traceability
+        """
         self.settings = get_settings().storage.jsonl
         self.output_dir = Path(self.settings.output_directory)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.current_file = None
         self.current_date = None
+        self.job_id = job_id
+
+        # Generate timestamp at initialization for consistent filenames within a session
+        self._session_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
         logger.info(
             "JSONL backend initialized",
-            extra={"output_dir": str(self.output_dir)}
+            extra={
+                "output_dir": str(self.output_dir),
+                "session_timestamp": self._session_timestamp
+            }
         )
 
-    def _get_file_path(self) -> Path:
-        """Get current file path (daily rotation)."""
-        if self.settings.use_daily_files:
-            date_str = datetime.now().strftime("%Y-%m-%d")
-            filename = f"{self.settings.file_prefix}_{date_str}.jsonl"
+    def _get_file_path(self, use_session_timestamp: bool = True) -> Path:
+        """
+        Get output file path with human-readable timestamp.
+
+        Args:
+            use_session_timestamp: If True, use session timestamp for consistency.
+                                   If False, generate new timestamp (for daily rotation).
+
+        Returns:
+            Path to output file
+        """
+        # Determine timestamp format based on settings
+        timestamp_format = getattr(self.settings, 'timestamp_format', 'datetime')
+
+        if timestamp_format == 'datetime':
+            # Human-readable datetime: YYYY-MM-DD_HH-MM-SS
+            if use_session_timestamp:
+                timestamp_str = self._session_timestamp
+            else:
+                timestamp_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        elif timestamp_format == 'date' or getattr(self.settings, 'use_daily_files', False):
+            # Date only: YYYY-MM-DD (legacy support)
+            timestamp_str = datetime.now().strftime("%Y-%m-%d")
+        else:
+            # No timestamp
+            timestamp_str = None
+
+        # Build filename
+        if timestamp_str:
+            if self.job_id:
+                filename = f"{self.settings.file_prefix}_{timestamp_str}_{self.job_id[:8]}.jsonl"
+            else:
+                filename = f"{self.settings.file_prefix}_{timestamp_str}.jsonl"
         else:
             filename = f"{self.settings.file_prefix}.jsonl"
 
@@ -104,6 +145,10 @@ class JSONLBackend(StorageBackend):
             filename += ".bz2"
 
         return self.output_dir / filename
+
+    def get_output_file_path(self) -> str:
+        """Get the current output file path as string (for external reference)."""
+        return str(self._get_file_path())
 
     def save(self, document: ProcessedDocument) -> bool:
         """Save single document to JSONL file."""
@@ -640,19 +685,20 @@ class StorageBackendFactory:
     """Factory for creating storage backend instances."""
 
     @staticmethod
-    def create_backend(backend_name: str) -> Optional[StorageBackend]:
+    def create_backend(backend_name: str, job_id: Optional[str] = None) -> Optional[StorageBackend]:
         """
         Create storage backend by name.
 
         Args:
             backend_name: Backend name ("jsonl", "postgresql", "elasticsearch")
+            job_id: Optional job ID for traceability in output filenames
 
         Returns:
             Backend instance or None if creation failed
         """
         try:
             if backend_name == "jsonl":
-                return JSONLBackend()
+                return JSONLBackend(job_id=job_id)
             elif backend_name == "postgresql":
                 return PostgreSQLBackend()
             elif backend_name == "elasticsearch":
@@ -666,9 +712,12 @@ class StorageBackendFactory:
             return None
 
     @staticmethod
-    def create_enabled_backends() -> List[StorageBackend]:
+    def create_enabled_backends(job_id: Optional[str] = None) -> List[StorageBackend]:
         """
         Create all enabled backends from configuration.
+
+        Args:
+            job_id: Optional job ID for traceability in output filenames
 
         Returns:
             List of backend instances
@@ -677,7 +726,7 @@ class StorageBackendFactory:
         backends = []
 
         for backend_name in settings.enabled_backends:
-            backend = StorageBackendFactory.create_backend(backend_name)
+            backend = StorageBackendFactory.create_backend(backend_name, job_id=job_id)
             if backend:
                 backends.append(backend)
 
@@ -696,9 +745,16 @@ class MultiBackendWriter:
     Failure in one backend does not affect others.
     """
 
-    def __init__(self, backends: Optional[List[StorageBackend]] = None):
-        """Initialize with backends."""
-        self.backends = backends or StorageBackendFactory.create_enabled_backends()
+    def __init__(self, backends: Optional[List[StorageBackend]] = None, job_id: Optional[str] = None):
+        """
+        Initialize with backends.
+
+        Args:
+            backends: Optional list of pre-configured backends
+            job_id: Optional job ID for traceability in output filenames
+        """
+        self.backends = backends or StorageBackendFactory.create_enabled_backends(job_id=job_id)
+        self.job_id = job_id
 
         logger.info(f"MultiBackendWriter initialized with {len(self.backends)} backends")
 
