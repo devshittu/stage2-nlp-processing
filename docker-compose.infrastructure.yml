@@ -229,6 +229,9 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - huggingface_cache:/root/.cache/huggingface
+      # Shared volumes for inter-stage communication
+      - ../stage1-cleaning-service/shared_volume/stage1/output:/app/shared_volume/stage1/output:ro
+      - ./shared_volume/stage2/output:/app/shared_volume/stage2/output:rw
 
     deploy:
       resources:
@@ -349,6 +352,9 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - huggingface_cache:/root/.cache/huggingface
+      # Shared volumes for inter-stage communication
+      - ../stage1-cleaning-service/shared_volume/stage1/output:/app/shared_volume/stage1/output:ro
+      - ./shared_volume/stage2/output:/app/shared_volume/stage2/output:rw
 
     deploy:
       resources:
@@ -410,7 +416,7 @@ services:
       # -------------------------------------------------------------------------
       # Event Consumer Configuration
       # -------------------------------------------------------------------------
-      - EVENT_CONSUMER_ENABLED=${EVENT_CONSUMER_ENABLED:-false}
+      - EVENT_CONSUMER_ENABLED=${EVENT_CONSUMER_ENABLED:-true}
       - STAGE1_EVENT_STREAM=${STAGE1_EVENT_STREAM:-stage1:cleaning:events}
       - AUTO_PROCESS=${AUTO_PROCESS:-true}
 
@@ -458,7 +464,7 @@ services:
       # -------------------------------------------------------------------------
       # Shared Data Directory (Stage 1 → Stage 2 file transfer)
       # -------------------------------------------------------------------------
-      - SHARED_STAGE1_DIR=/shared/stage1
+      - SHARED_STAGE1_DIR=/app/shared_volume/stage1/output
 
       # -------------------------------------------------------------------------
       # Observability
@@ -470,8 +476,8 @@ services:
       - ./config:/app/config:ro
       - ./data:/app/data
       - ./logs:/app/logs
-      # Shared directory for reading Stage 1 outputs
-      - /shared/stage1:/shared/stage1:ro
+      # Shared volumes for inter-stage communication
+      - ../stage1-cleaning-service/shared_volume/stage1/output:/app/shared_volume/stage1/output:ro
 
     deploy:
       resources:
