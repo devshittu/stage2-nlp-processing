@@ -20,10 +20,11 @@ Environment Variables:
 """
 
 import asyncio
+import json
 import logging
 import os
 import signal
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 from src.events.consumer import get_event_consumer, CloudEventConsumer
@@ -140,7 +141,7 @@ class EventConsumerService:
         # TODO: Implement individual document processing
         # Options:
         # 1. Read document from PostgreSQL
-        # 2. Read from /shared/stage1/ if file path provided
+        # 2. Read from shared_volume/stage1/output/ if file path provided
         # 3. Process embedded text if included in event
 
         # For now, just log
@@ -150,7 +151,18 @@ class EventConsumerService:
 
     async def handle_job_completed(self, data: Dict[str, Any]) -> bool:
         """
-        Handle batch job completed event.
+        Handle batch job completed event from Stage 1.
+
+        Event data structure (from Stage 1):
+        {
+            "job_id": "uuid",
+            "batch_id": "batch_2026-01-07",
+            "documents_processed": 100,
+            "documents_failed": 0,
+            "documents_total": 100,
+            "processing_time_ms": 120000,
+            "output_files": ["/app/data/output/processed_2026-01-07_10-30-45.jsonl"]
+        }
 
         Args:
             data: Event data with job details
@@ -161,22 +173,25 @@ class EventConsumerService:
         job_id = data.get("job_id")
         batch_id = data.get("batch_id")
         documents_processed = data.get("documents_processed", 0)
+        output_files = data.get("output_files", [])
 
         logger.info(
             f"job_completed_event_received: job_id={job_id}, "
-            f"batch_id={batch_id}, documents={documents_processed}"
+            f"batch_id={batch_id}, documents={documents_processed}, "
+            f"output_files={output_files}"
         )
 
         if documents_processed == 0:
             logger.warning(f"job_has_no_documents: job_id={job_id}")
             return True
 
-        # Trigger NLP batch processing
+        # Trigger NLP batch processing with output file paths
         try:
             success = await self.trigger_nlp_batch_processing(
                 job_id=job_id,
                 batch_id=batch_id,
-                document_count=documents_processed
+                document_count=documents_processed,
+                output_files=output_files
             )
 
             if success:
@@ -202,39 +217,250 @@ class EventConsumerService:
         self,
         job_id: str,
         batch_id: str,
-        document_count: int
+        document_count: int,
+        output_files: Optional[List[str]] = None
     ) -> bool:
         """
         Trigger NLP batch processing for cleaned documents.
+
+        Strategy (flexible, configuration-driven):
+        1. Try reading from shared JSONL files (fastest, if available)
+        2. Fallback to PostgreSQL query (Stage 1 database)
+        3. Submit to Celery for async processing
 
         Args:
             job_id: Stage 1 job ID
             batch_id: Batch identifier
             document_count: Number of documents
+            output_files: Optional list of output file paths from Stage 1
 
         Returns:
             True if triggered successfully
         """
         logger.info(
             f"triggering_nlp_batch: job_id={job_id}, batch_id={batch_id}, "
-            f"count={document_count}"
+            f"count={document_count}, files={output_files}"
         )
 
-        # TODO: Implement actual trigger logic
-        # Options:
-        # 1. Call internal API endpoint
-        # 2. Submit Celery task directly
-        # 3. Read from /shared/stage1/ and process
+        try:
+            # Strategy 1: Read from shared JSONL files (preferred)
+            documents = await self._read_documents_from_files(output_files, job_id, batch_id)
 
-        # For now, simulate processing
-        await asyncio.sleep(0.1)  # Simulate work
+            if not documents:
+                # Strategy 2: Fallback to Stage 1 PostgreSQL
+                documents = await self._read_documents_from_stage1_db(job_id, batch_id)
 
-        logger.info(
-            f"nlp_batch_processing_queued: job_id={job_id}, "
-            f"stage1_job_id={job_id}, documents={document_count}"
-        )
+            if not documents:
+                logger.warning(
+                    f"no_documents_found_for_nlp: job_id={job_id}, batch_id={batch_id}"
+                )
+                return False
 
-        return True
+            logger.info(
+                f"loaded_documents_for_nlp: count={len(documents)}, "
+                f"job_id={job_id}, batch_id={batch_id}"
+            )
+
+            # Strategy 3: Submit to Celery for async processing
+            success = await self._submit_to_celery(documents, job_id, batch_id)
+
+            if success:
+                logger.info(
+                    f"nlp_batch_processing_queued: job_id={job_id}, "
+                    f"stage1_job_id={job_id}, documents={len(documents)}"
+                )
+            else:
+                logger.error(
+                    f"failed_to_queue_nlp_batch: job_id={job_id}"
+                )
+
+            return success
+
+        except Exception as e:
+            logger.error(
+                f"trigger_nlp_batch_error: job_id={job_id}, error={e}",
+                exc_info=True
+            )
+            return False
+
+    async def _read_documents_from_files(
+        self,
+        output_files: Optional[List[str]],
+        job_id: str,
+        batch_id: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Read cleaned documents from Stage 1 output JSONL files.
+
+        Supports multiple file locations:
+        - Explicit paths from event data
+        - Shared directory discovery
+        - Volume mount paths
+        """
+        documents = []
+
+        # Get shared directory from environment
+        shared_dir = os.getenv("SHARED_STAGE1_DIR", "/shared/stage1")
+
+        # File paths to try
+        file_paths = []
+
+        # 1. Use explicit output_files from event
+        if output_files:
+            file_paths.extend(output_files)
+
+        # 2. Try common naming patterns in shared directory
+        if os.path.isdir(shared_dir):
+            import glob
+            # Match Stage 1 output naming convention: processed_YYYY-MM-DD_HH-MM-SS*.jsonl
+            # SHARED_STAGE1_DIR points directly to output directory
+            patterns = [
+                f"{shared_dir}/processed_*.jsonl",
+                f"{shared_dir}/*.jsonl",
+            ]
+            for pattern in patterns:
+                matches = glob.glob(pattern)
+                # Sort by modification time (newest first)
+                matches.sort(key=os.path.getmtime, reverse=True)
+                file_paths.extend(matches[:5])  # Take top 5 newest
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_paths = []
+        for path in file_paths:
+            if path not in seen:
+                seen.add(path)
+                unique_paths.append(path)
+
+        # Read documents from files
+        for file_path in unique_paths:
+            try:
+                if os.path.exists(file_path):
+                    count = 0
+                    with open(file_path, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                doc = json.loads(line)
+                                # Filter by job_id if available
+                                if doc.get("job_id") == job_id or not doc.get("job_id"):
+                                    documents.append(doc)
+                                    count += 1
+                    if count > 0:
+                        logger.info(
+                            f"read_documents_from_file: path={file_path}, count={count}"
+                        )
+            except Exception as e:
+                logger.warning(f"failed_to_read_file: path={file_path}, error={e}")
+
+        return documents
+
+    async def _read_documents_from_stage1_db(
+        self,
+        job_id: str,
+        batch_id: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Read cleaned documents from Stage 1 PostgreSQL database.
+
+        Fallback when shared files are not available.
+        """
+        documents = []
+
+        # Stage 1 database connection parameters
+        stage1_host = os.getenv("STAGE1_POSTGRES_HOST", "postgres")
+        stage1_port = int(os.getenv("STAGE1_POSTGRES_PORT", "5432"))
+        stage1_db = os.getenv("STAGE1_POSTGRES_DB", "stage1_cleaning")
+        stage1_user = os.getenv("STAGE1_POSTGRES_USER", "stage1_user")
+        stage1_password = os.getenv("STAGE1_POSTGRES_PASSWORD", "")
+
+        if not stage1_password:
+            logger.warning("stage1_postgres_password_not_configured")
+            return documents
+
+        try:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+
+            conn = psycopg2.connect(
+                host=stage1_host,
+                port=stage1_port,
+                database=stage1_db,
+                user=stage1_user,
+                password=stage1_password,
+                connect_timeout=10
+            )
+
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Query processed articles by job_id or batch_id
+                query = """
+                    SELECT *
+                    FROM processed_articles
+                    WHERE job_id = %s OR batch_id = %s
+                    ORDER BY processed_at DESC
+                    LIMIT 10000
+                """
+                cur.execute(query, (job_id, batch_id))
+                rows = cur.fetchall()
+
+                for row in rows:
+                    documents.append(dict(row))
+
+            conn.close()
+
+            logger.info(
+                f"read_documents_from_stage1_db: count={len(documents)}, "
+                f"job_id={job_id}, batch_id={batch_id}"
+            )
+
+        except ImportError:
+            logger.warning("psycopg2_not_installed_cannot_read_stage1_db")
+        except Exception as e:
+            logger.error(f"stage1_db_read_error: {e}")
+
+        return documents
+
+    async def _submit_to_celery(
+        self,
+        documents: List[Dict[str, Any]],
+        job_id: str,
+        batch_id: str
+    ) -> bool:
+        """
+        Submit documents to Stage 2 Celery for batch processing.
+
+        Uses the existing process_batch_task from celery_tasks.py.
+        """
+        try:
+            # Import Celery task
+            from src.core.celery_tasks import process_batch_task
+
+            # Generate Stage 2 batch ID (linked to Stage 1)
+            stage2_batch_id = f"s2_{batch_id}" if batch_id else f"s2_from_{job_id[:8]}"
+
+            # Submit to Celery (async)
+            task = process_batch_task.delay(
+                documents=documents,
+                batch_id=stage2_batch_id,
+                options={
+                    "stage1_job_id": job_id,
+                    "triggered_by": "event_consumer"
+                }
+            )
+
+            logger.info(
+                f"celery_task_submitted: task_id={task.id}, "
+                f"batch_id={stage2_batch_id}, documents={len(documents)}"
+            )
+
+            return True
+
+        except ImportError:
+            logger.error("celery_tasks_not_available")
+            return False
+        except Exception as e:
+            logger.error(f"celery_submission_error: {e}", exc_info=True)
+            return False
 
     async def run(self):
         """
