@@ -103,3 +103,9 @@ batch_analysis_*/
 # Keep the directory (for Docker COPY) but ignore all contents except .gitkeep
 .shared-metadata-registry/*
 !.shared-metadata-registry/.gitkeep
+
+# Shared volume for inter-stage communication (keep directory structure via .gitkeep)
+shared_volume/stage1/output/*
+!shared_volume/stage1/output/.gitkeep
+shared_volume/stage2/output/*
+!shared_volume/stage2/output/.gitkeep

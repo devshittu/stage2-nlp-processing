@@ -60,7 +60,7 @@ class WebhookBackend(EventBackend):
         retry_strategy = Retry(
             total=retry_attempts,
             status_forcelist=[429, 500, 502, 503, 504],
-            method_whitelist=["POST"],
+            allowed_methods=["POST"],
             backoff_factor=retry_delay_seconds if retry_backoff == "exponential" else 0
         )
 

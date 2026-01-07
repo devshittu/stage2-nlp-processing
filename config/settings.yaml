@@ -342,10 +342,11 @@ storage:
 
   # JSONL storage configuration
   jsonl:
-    output_directory: "/app/data/output"  # Outputs go to structured output/ subdirectory
+    # Output to shared_volume for inter-stage communication (Stage 2 → Stage 3)
+    output_directory: "/app/shared_volume/stage2/output"
     file_prefix: "extracted_events"
     # Timestamp format: "datetime" (YYYY-MM-DD_HH-MM-SS), "date" (YYYY-MM-DD), or "none"
-    timestamp_format: "datetime"  # Human-readable datetime stamps for all outputs
+    timestamp_format: "datetime"
     use_daily_files: false  # Deprecated: use timestamp_format instead
     compression: null  # Options: "gzip", "bz2", null
     append_mode: true
@@ -543,18 +544,18 @@ resource_lifecycle:
 # INTER-STAGE COMMUNICATION (Event Publishing)
 # =============================================================================
 events:
-  # Global enable/disable (backward compatibility - disabled by default)
-  enabled: false
+  # Global enable/disable for Stage 2 → Stage 3 event publishing
+  enabled: true
 
   # Single backend mode (backward compatible)
   backend: "redis_streams"
 
   # Multi-backend mode - publish to multiple backends simultaneously
-  # Uncomment to enable multiple backends (Redis Streams + Webhooks)
+  # Redis Streams (primary) + Webhooks (fallback) for downstream stages
   # If 'backends' is set, it takes precedence over 'backend'
-  # backends:
-  #   - "redis_streams"
-  #   - "webhook"
+  backends:
+    - "redis_streams"
+    - "webhook"
 
   # Event filtering - control which events to publish
   publish_events:
@@ -563,10 +564,10 @@ events:
     batch_started: true
     batch_completed: true
 
-  # Redis Streams configuration (default backend)
+  # Redis Streams configuration (Stage 2 → Stage 3)
   redis_streams:
-    url: "redis://redis:6379/1"  # Same as caching Redis
-    stream_name: "nlp-events"
+    url: "redis://redis-cache:6379/3"  # Stage 2 output: DB 3 (per infrastructure rules)
+    stream_name: "stage2:nlp:events"  # Namespace for Stage 2 output events
     max_len: 10000  # Maximum stream length (older entries trimmed)
     ttl_seconds: 86400  # 24 hours retention
     connection_pool:
@@ -601,17 +602,21 @@ events:
     routing_key: "document.processed"
     durable: true
 
-  # Webhook configuration (for HTTP callbacks)
+  # Webhook configuration (for HTTP callbacks to Stage 3+)
+  # CloudEvents v1.0 HTTP Binary Content Mode (2026 Standard)
   webhook:
+    # Stage 3 webhook endpoints (2026 REST API standard)
+    # Format: /api/v1/webhooks/{source}/{event-category}
     urls:
-      - "http://stage3-embedding:8000/webhook/nlp-events"
+      - "http://stage3-embedding:8000/api/v1/webhooks/stage2/events"
     headers:
-      X-API-Key: "${WEBHOOK_API_KEY}"  # From environment
-    timeout_seconds: 5
+      X-Stage-Source: "stage2-nlp"
+      X-Pipeline-Version: "1.0.0"
+    timeout_seconds: 30
     retry_attempts: 3
     retry_backoff: "exponential"  # or "linear"
-    retry_delay_seconds: 1
-    verify_ssl: true
+    retry_delay_seconds: 2
+    verify_ssl: false  # False for internal services
 
   # Monitoring and observability for events
   monitoring:

@@ -11,7 +11,7 @@ Schema Design:
 """
 
 from typing import List, Optional, Dict, Any, Tuple
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from datetime import datetime, date
 from enum import Enum
 
@@ -256,6 +256,8 @@ class Storyline(BaseModel):
 
 class NERServiceResponse(BaseModel):
     """Response from NER service."""
+    model_config = ConfigDict(protected_namespaces=())
+
     document_id: str = Field(..., description="Document ID")
     entities: List[Entity] = Field(..., description="Extracted entities")
     processing_time_ms: float = Field(..., description="Processing time in milliseconds")
@@ -264,6 +266,8 @@ class NERServiceResponse(BaseModel):
 
 class DPServiceResponse(BaseModel):
     """Response from Dependency Parsing service."""
+    model_config = ConfigDict(protected_namespaces=())
+
     document_id: str = Field(..., description="Document ID")
     soa_triplets: List[SOATriplet] = Field(..., description="Subject-Object-Action triplets")
     dependencies: Optional[List[DependencyRelation]] = Field(None, description="Raw dependencies")
@@ -273,6 +277,8 @@ class DPServiceResponse(BaseModel):
 
 class EventLLMServiceResponse(BaseModel):
     """Response from Event LLM service."""
+    model_config = ConfigDict(protected_namespaces=())
+
     document_id: str = Field(..., description="Document ID")
     events: List[Event] = Field(..., description="Extracted events")
     processing_time_ms: float = Field(..., description="Processing time in milliseconds")

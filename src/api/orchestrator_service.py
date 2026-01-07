@@ -32,9 +32,10 @@ Pipeline Flow (Single Document):
 9. Return ProcessedDocument to client
 """
 
+import asyncio
+import os
 import time
 import uuid
-import asyncio
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
@@ -71,6 +72,9 @@ from src.utils.document_processor import get_document_processor
 from src.core.event_linker import get_event_linker
 from src.storage.backends import MultiBackendWriter
 from src.core.resource_lifecycle_manager import get_resource_manager
+
+# Webhook router for Stage 1 → Stage 2 integration
+from src.api.webhooks import router as webhook_router
 
 
 # =============================================================================
@@ -125,6 +129,10 @@ storage_writer: Optional[MultiBackendWriter] = None
 # Event publisher for inter-stage communication
 event_publisher: Optional[Any] = None
 
+# Event consumer service (Redis Streams)
+event_consumer_service: Optional[Any] = None
+event_consumer_task: Optional[asyncio.Task] = None
+
 
 # =============================================================================
 # FastAPI Application Setup with Lifespan
@@ -136,7 +144,7 @@ async def lifespan(app: FastAPI):
     Application lifespan context manager.
     Handles startup and shutdown logic.
     """
-    global http_client, storage_writer, event_publisher
+    global http_client, storage_writer, event_publisher, event_consumer_service, event_consumer_task
 
     # Startup
     logger.info("Starting orchestrator service...")
@@ -176,12 +184,49 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize event publisher: {e}", exc_info=True)
         event_publisher = None
 
+    # Initialize event consumer for Stage 1 → Stage 2 integration (optional)
+    # Enable via EVENT_CONSUMER_IN_ORCHESTRATOR=true or config.event_consumer.run_in_orchestrator
+    run_consumer_in_orchestrator = os.getenv("EVENT_CONSUMER_IN_ORCHESTRATOR", "false").lower() == "true"
+
+    if run_consumer_in_orchestrator:
+        try:
+            from src.services.event_consumer_service import EventConsumerService
+            event_consumer_service = EventConsumerService()
+            success = await event_consumer_service.initialize()
+
+            if success:
+                # Start consumer in background task
+                event_consumer_task = asyncio.create_task(event_consumer_service.run())
+                logger.info("Event consumer started in orchestrator (background task)")
+            else:
+                logger.warning("Event consumer initialization failed - not starting")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize event consumer in orchestrator: {e}", exc_info=True)
+            event_consumer_service = None
+    else:
+        logger.info("Event consumer not running in orchestrator (use separate event-consumer service)")
+
     logger.info("Orchestrator service started successfully")
 
     yield
 
     # Shutdown
     logger.info("Shutting down orchestrator service...")
+
+    # Stop event consumer task
+    if event_consumer_task and not event_consumer_task.done():
+        logger.info("Stopping event consumer task...")
+        event_consumer_task.cancel()
+        try:
+            await asyncio.wait_for(event_consumer_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        logger.info("Event consumer task stopped")
+
+    if event_consumer_service:
+        await event_consumer_service.stop()
+        logger.info("Event consumer service closed")
 
     if http_client:
         await http_client.aclose()
@@ -1047,7 +1092,11 @@ async def get_job_status(job_id: str):
 # Include the versioned API router
 app.include_router(api_v1_router)
 
+# Include webhook router for Stage 1 → Stage 2 event integration
+app.include_router(webhook_router)
+
 logger.info(f"API {API_VERSION} routes registered at {API_VERSION_PREFIX}")
+logger.info("Webhook routes registered at /api/v1/webhooks/stage1/*")
 
 
 # =============================================================================
