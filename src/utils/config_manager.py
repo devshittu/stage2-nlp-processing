@@ -17,7 +17,7 @@ import re
 import yaml
 import logging
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,8 @@ class DocumentFieldMapping(BaseModel):
 
 class NERServiceSettings(BaseModel):
     """Named Entity Recognition service settings."""
+    model_config = ConfigDict(protected_namespaces=())
+
     port: int = Field(default=8001, description="Service port")
     model_name: str = Field(default="Babelscape/wikineural-multilingual-ner")
     batch_size: int = Field(default=16, description="GPU batch size")
@@ -68,6 +70,8 @@ class NERServiceSettings(BaseModel):
 
 class DPServiceSettings(BaseModel):
     """Dependency Parsing service settings."""
+    model_config = ConfigDict(protected_namespaces=())
+
     port: int = Field(default=8002, description="Service port")
     model_name: str = Field(default="en_core_web_trf")
     batch_size: int = Field(default=8, description="GPU batch size")
@@ -80,6 +84,8 @@ class DPServiceSettings(BaseModel):
 
 class EventLLMServiceSettings(BaseModel):
     """Event LLM service settings with vLLM optimization."""
+    model_config = ConfigDict(protected_namespaces=())
+
     port: int = Field(default=8003, description="Service port")
     model_name: str = Field(default="mistralai/Mistral-7B-Instruct-v0.3")
     use_vllm: bool = Field(default=True, description="Use vLLM for optimization")
