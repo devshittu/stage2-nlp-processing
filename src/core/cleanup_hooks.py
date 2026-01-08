@@ -93,8 +93,10 @@ class VLLMCleanupHook:
                 results["actions"].append("cleared_gpu_cache")
 
             # Clear KV cache (vLLM-specific, releases attention cache)
-            # Check framework hooks for vLLM-specific settings
-            vllm_config = self.config.framework_hooks.vllm if hasattr(self.config, 'framework_hooks') else None
+            # Check framework hooks for vLLM-specific settings from config
+            from src.utils.config_manager import get_settings
+            settings = get_settings()
+            vllm_config = settings.framework_hooks.vllm if hasattr(settings, 'framework_hooks') and hasattr(settings.framework_hooks, 'vllm') else None
             if vllm_config and getattr(vllm_config, "clear_kv_cache", False):
                 self._clear_kv_cache()
                 results["actions"].append("cleared_kv_cache")
