@@ -124,23 +124,23 @@ dp_service:
 event_llm_service:
   port: 8003
 
-  # Model configuration
-  model_name: "mistralai/Mistral-7B-Instruct-v0.3"
-  # Alternatives for consideration (Dec 2025):
+  # Model configuration - AWQ 4-bit quantized for 16GB VRAM
+  model_name: "solidrust/Mistral-7B-Instruct-v0.3-AWQ"
+  # AWQ reduces model from ~14GB to ~4GB, enabling vLLM on 16GB GPU
+  # Original: "mistralai/Mistral-7B-Instruct-v0.3" (requires 24GB+ VRAM for vLLM)
+  # Alternatives:
   # - "mistralai/Mistral-Nemo-Instruct-2407" (12B, balanced)
   # - "meta-llama/Llama-3.1-8B-Instruct" (8B, good quality)
-  # - "Qwen/Qwen2.5-7B-Instruct" (7B, efficient)
 
   # vLLM settings for optimized inference
-  use_vllm: true
+  use_vllm: true  # Enabled with AWQ quantization
   tensor_parallel_size: 1  # Set to number of GPUs (1 for single RTX A4000)
-  gpu_memory_utilization: 0.95  # Use 95% of 16GB VRAM
-  max_model_len: 1024  # Maximum context length (reduced to fit KV cache constraints)
+  gpu_memory_utilization: 0.90  # Use 90% of 16GB VRAM - AWQ model is ~4GB, plenty of KV cache room
+  max_model_len: 4096  # Full context length - AWQ leaves headroom for KV cache
 
   # Quantization for memory efficiency
-  quantization: null  # Options: "awq", "gptq", null for no quantization
-  # AWQ provides better quality than GPTQ at similar speed
-  # NOTE: Disabled quantization since the base model doesn't have AWQ weights
+  quantization: "awq"  # AWQ 4-bit quantization enabled
+  # AWQ provides ~99% quality at 4x memory reduction
   dtype: "auto"  # auto, float16, bfloat16
 
   # Generation parameters
@@ -150,7 +150,7 @@ event_llm_service:
   top_k: 50
 
   # Chunking strategy for long documents
-  chunk_size_tokens: 2048  # Tokens per chunk
+  chunk_size_tokens: 2048  # Tokens per chunk (fits within 4096 context with ~1500 token prompt)
   chunk_overlap_tokens: 256  # Overlap between chunks to preserve context
 
   # Batch inference settings
@@ -403,7 +403,7 @@ caching:
 # =============================================================================
 resource_lifecycle:
   # Global enable/disable for intelligent resource cleanup
-  enabled: true  # Re-enabled after fixing vLLM generation hang
+  enabled: true  # Re-enabled with proper vLLM configuration
 
   # Memory pressure monitoring
   memory_monitoring:
