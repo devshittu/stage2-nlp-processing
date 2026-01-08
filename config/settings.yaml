@@ -608,7 +608,7 @@ events:
     # Stage 3 webhook endpoints (2026 REST API standard)
     # Format: /api/v1/webhooks/{source}/{event-category}
     urls:
-      - "http://stage3-embedding:8000/api/v1/webhooks/stage2/events"
+      - "http://stage3-embedding-orchestrator:8000/api/v1/webhooks/stage2/events"
     headers:
       X-Stage-Source: "stage2-nlp"
       X-Pipeline-Version: "1.0.0"
