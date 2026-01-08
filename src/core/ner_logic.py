@@ -87,8 +87,8 @@ class NERModel:
             for key, value in config_override.items():
                 setattr(self.config, key, value)
 
-        # Device setup
-        self.device = get_device()
+        # Device setup - check per-service GPU settings
+        self.device = get_device(service_name="ner_service")
         logger.info(
             f"Initializing NER model on device: {self.device}",
             extra={
