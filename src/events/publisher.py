@@ -303,6 +303,13 @@ def create_event_publisher(config: Any) -> EventPublisher:
     - Single: config.events.backend = "redis_streams"
     - Multiple: config.events.backends = ["redis_streams", "webhook"]
 
+    Available backends:
+    - redis_streams: Redis Streams (default, always available)
+    - webhook: HTTP webhook callbacks (always available)
+    - kafka: Apache Kafka (requires kafka-python)
+    - nats: NATS messaging (requires nats-py)
+    - rabbitmq: RabbitMQ (requires pika)
+
     Args:
         config: Configuration object with events section
 
@@ -318,6 +325,11 @@ def create_event_publisher(config: Any) -> EventPublisher:
     from .backends.redis_streams import RedisStreamsBackend
     from .backends.webhook import WebhookBackend
     from .backends.multi import MultiBackend
+    from .backends import (
+        KafkaBackend, KAFKA_AVAILABLE,
+        NATSBackend, NATS_AVAILABLE,
+        RabbitMQBackend, RABBITMQ_AVAILABLE
+    )
 
     # Determine if using single or multiple backends
     backend_types = []
@@ -368,6 +380,51 @@ def create_event_publisher(config: Any) -> EventPublisher:
                 )
                 backends.append(backend)
                 logger.info(f"Initialized WebhookBackend: {len(webhook_config.urls)} endpoint(s)")
+
+            elif backend_type == "kafka":
+                if not KAFKA_AVAILABLE:
+                    logger.warning("Kafka backend requested but kafka-python not installed, skipping")
+                    continue
+                kafka_config = config.events.kafka
+                backend = KafkaBackend(
+                    bootstrap_servers=kafka_config.brokers if isinstance(kafka_config.brokers, list) else [kafka_config.brokers],
+                    topic=kafka_config.topic,
+                    client_id=getattr(kafka_config, "client_id", "stage2-nlp-publisher"),
+                    acks=getattr(kafka_config, "acks", "all"),
+                    retries=getattr(kafka_config, "retries", 3),
+                    compression_type=getattr(kafka_config, "compression", "gzip")
+                )
+                backends.append(backend)
+                logger.info(f"Initialized KafkaBackend: {kafka_config.topic}")
+
+            elif backend_type == "nats":
+                if not NATS_AVAILABLE:
+                    logger.warning("NATS backend requested but nats-py not installed, skipping")
+                    continue
+                nats_config = config.events.nats
+                backend = NATSBackend(
+                    servers=nats_config.servers if isinstance(nats_config.servers, list) else [nats_config.servers],
+                    subject=getattr(nats_config, "subject", "nlp.events"),
+                    client_name=getattr(nats_config, "client_name", "stage2-nlp-publisher"),
+                    use_jetstream=getattr(nats_config, "use_jetstream", False)
+                )
+                backends.append(backend)
+                logger.info(f"Initialized NATSBackend: {nats_config.servers}")
+
+            elif backend_type == "rabbitmq":
+                if not RABBITMQ_AVAILABLE:
+                    logger.warning("RabbitMQ backend requested but pika not installed, skipping")
+                    continue
+                rabbitmq_config = config.events.rabbitmq
+                backend = RabbitMQBackend(
+                    url=rabbitmq_config.url,
+                    exchange=rabbitmq_config.exchange,
+                    exchange_type=getattr(rabbitmq_config, "exchange_type", "topic"),
+                    routing_key=getattr(rabbitmq_config, "routing_key", "document.processed"),
+                    durable=getattr(rabbitmq_config, "durable", True)
+                )
+                backends.append(backend)
+                logger.info(f"Initialized RabbitMQBackend: {rabbitmq_config.exchange}")
 
             else:
                 logger.warning(f"Unknown backend type: {backend_type}, skipping")
