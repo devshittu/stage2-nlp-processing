@@ -94,7 +94,7 @@ class DependencyParser:
         self.settings = get_settings()
         self.dp_settings = self.settings.dp_service
         self.model_name = self.dp_settings.model_name
-        self.device = get_device()
+        self.device = get_device(service_name="dp_service")
         self.batch_size = self.dp_settings.batch_size
         self.nlp: Optional[spacy.Language] = None
 
