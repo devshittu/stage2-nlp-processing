@@ -492,10 +492,24 @@ class EventConsumerSettings(BaseModel):
     backlog_max_age_hours: int = Field(default=72, description="Max age for backlog events")
 
 
+class ServiceGpuSettings(BaseModel):
+    """GPU settings for a specific service."""
+    gpu_enabled: bool = Field(default=True, description="Enable GPU for this service")
+    device: str = Field(default="cuda", description="Device to use (cuda or cpu)")
+
+
+class PerServiceGpuSettings(BaseModel):
+    """Per-service GPU configuration overrides."""
+    ner_service: ServiceGpuSettings = Field(default_factory=ServiceGpuSettings)
+    dp_service: ServiceGpuSettings = Field(default_factory=ServiceGpuSettings)
+    event_llm_service: ServiceGpuSettings = Field(default_factory=lambda: ServiceGpuSettings(gpu_enabled=True, device="cuda"))
+
+
 class Settings(BaseModel):
     """Root configuration model."""
     general: GeneralSettings = Field(default_factory=GeneralSettings)
     document_field_mapping: DocumentFieldMapping = Field(default_factory=DocumentFieldMapping)
+    per_service_gpu: PerServiceGpuSettings = Field(default_factory=PerServiceGpuSettings)
     ner_service: NERServiceSettings = Field(default_factory=NERServiceSettings)
     dp_service: DPServiceSettings = Field(default_factory=DPServiceSettings)
     event_llm_service: EventLLMServiceSettings = Field(default_factory=EventLLMServiceSettings)
@@ -671,14 +685,41 @@ def get_settings() -> Settings:
     return ConfigManager.get_settings()
 
 
-def get_device() -> str:
+def get_device(service_name: str = None) -> str:
     """
     Get device for model inference (cuda or cpu).
 
+    Checks per-service GPU settings first, then falls back to general settings.
+
+    Args:
+        service_name: Optional service name to check per-service GPU settings
+                     (e.g., 'ner_service', 'dp_service', 'event_llm_service')
+
     Returns:
-        Device string
+        Device string ('cuda' or 'cpu')
     """
     settings = get_settings()
+
+    # Check per-service GPU settings first
+    if service_name and hasattr(settings, 'per_service_gpu'):
+        per_service = getattr(settings.per_service_gpu, service_name, None)
+        if per_service:
+            gpu_enabled = getattr(per_service, 'gpu_enabled', None)
+            device = getattr(per_service, 'device', None)
+            if gpu_enabled is not None:
+                if not gpu_enabled or device == 'cpu':
+                    logger.debug(f"Per-service setting: {service_name} using CPU")
+                    return "cpu"
+                elif gpu_enabled and device == 'cuda':
+                    import torch
+                    if torch.cuda.is_available():
+                        logger.debug(f"Per-service setting: {service_name} using CUDA")
+                        return "cuda"
+                    else:
+                        logger.warning(f"GPU requested for {service_name} but CUDA not available. Falling back to CPU.")
+                        return "cpu"
+
+    # Fall back to general settings
     if settings.general.gpu_enabled and settings.general.device == "cuda":
         import torch
         if torch.cuda.is_available():

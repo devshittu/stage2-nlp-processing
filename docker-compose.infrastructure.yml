@@ -1,5 +1,3 @@
-version: '3.9'
-
 # =============================================================================
 # STAGE 2: NLP PROCESSING SERVICE - INFRASTRUCTURE INTEGRATION
 # =============================================================================
@@ -14,7 +12,7 @@ networks:
 
 services:
   # ===========================================================================
-  # NER SERVICE (Named Entity Recognition)
+  # NER SERVICE (Named Entity Recognition) - CPU-only
   # ===========================================================================
   ner-service:
     container_name: nlp-ner-service
@@ -27,10 +25,14 @@ services:
     environment:
       - SERVICE_NAME=stage2-nlp-ner
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - CUDA_VISIBLE_DEVICES=${NER_GPU_ID:-0}
+      # Force CPU-only mode to free GPU for Event LLM
+      - CUDA_VISIBLE_DEVICES=
       - TRANSFORMERS_CACHE=/app/models/cache
     volumes:
       - huggingface_cache:/app/models/cache
+      # Development mount for hot-reload
+      - ./src:/app/src:ro
+      - ./config:/app/config:ro
     deploy:
       resources:
         limits:
@@ -39,10 +41,7 @@ services:
         reservations:
           cpus: '2'
           memory: 4G
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+          # No GPU reservation - runs on CPU
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/api/v1/health"]
       interval: 30s
@@ -56,7 +55,7 @@ services:
     restart: unless-stopped
 
   # ===========================================================================
-  # DP SERVICE (Dependency Parsing)
+  # DP SERVICE (Dependency Parsing) - CPU-only
   # ===========================================================================
   dp-service:
     container_name: nlp-dp-service
@@ -69,10 +68,14 @@ services:
     environment:
       - SERVICE_NAME=stage2-nlp-dp
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - CUDA_VISIBLE_DEVICES=${DP_GPU_ID:-0}
+      # Force CPU-only mode to free GPU for Event LLM
+      - CUDA_VISIBLE_DEVICES=
       - TRANSFORMERS_CACHE=/app/models/cache
     volumes:
       - huggingface_cache:/app/models/cache
+      # Development mount for hot-reload
+      - ./src:/app/src:ro
+      - ./config:/app/config:ro
     deploy:
       resources:
         limits:
@@ -81,10 +84,7 @@ services:
         reservations:
           cpus: '2'
           memory: 4G
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+          # No GPU reservation - runs on CPU
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8002/api/v1/health"]
       interval: 30s
@@ -108,15 +108,27 @@ services:
     image: stage2-nlp-event-llm:latest
     networks:
       - storytelling
+    # Required for vLLM inter-process communication
+    shm_size: '16gb'
     environment:
       - SERVICE_NAME=stage2-nlp-event-llm
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - CUDA_VISIBLE_DEVICES=${EVENT_LLM_GPU_ID:-1}
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+      # Exclusive GPU access for vLLM (GPU 0)
+      - CUDA_VISIBLE_DEVICES=0
       - TRANSFORMERS_CACHE=/app/models/cache
       - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN}
       - HF_TOKEN=${HF_TOKEN}
+      # vLLM-specific environment variables
+      - VLLM_LOGGING_LEVEL=DEBUG
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+      - NCCL_P2P_DISABLE=1
+      # Prevent PyTorch memory fragmentation
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     volumes:
       - huggingface_cache:/app/models/cache
+      # Development mount for hot-reload (source code)
+      - ./src:/app/src:ro
+      - ./config:/app/config:ro
     deploy:
       resources:
         limits:
@@ -134,7 +146,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 120s
+      start_period: 180s
     labels:
       - "stage=2"
       - "service=event-llm"
@@ -152,6 +164,9 @@ services:
     image: stage2-nlp-orchestrator:latest
     networks:
       - storytelling
+    # Expose port for development/testing (use Traefik for production)
+    ports:
+      - "8000:8000"
     env_file:
       - .env
     environment:
@@ -229,6 +244,8 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - huggingface_cache:/root/.cache/huggingface
+      # Development mount for hot-reload
+      - ./src:/app/src:ro
       # Shared volumes for inter-stage communication
       - ../stage1-cleaning-service/shared_volume/stage1/output:/app/shared_volume/stage1/output:ro
       - ./shared_volume/stage2/output:/app/shared_volume/stage2/output:rw
