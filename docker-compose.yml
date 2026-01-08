@@ -24,7 +24,7 @@ services:
     restart: unless-stopped
 
   # =============================================================================
-  # NER SERVICE (Port 8001)
+  # NER SERVICE (Port 8001) - CPU-only
   # =============================================================================
   ner-service:
     build:
@@ -37,23 +37,19 @@ services:
       - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - CUDA_VISIBLE_DEVICES=${NER_GPU_ID:-0}  # Use env var or default to GPU 0
+      # Force CPU-only mode to free GPU for Event LLM
+      - CUDA_VISIBLE_DEVICES=
     env_file:
       - .env
     volumes:
       - ./config:/app/config:ro
       - ./logs:/app/logs
+      - ./src:/app/src:ro
       - huggingface_cache:/root/.cache/huggingface
     depends_on:
       redis:
         condition: service_healthy
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    # No GPU reservation - runs on CPU
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 30s
@@ -65,7 +61,7 @@ services:
     restart: unless-stopped
 
   # =============================================================================
-  # DEPENDENCY PARSING SERVICE (Port 8002)
+  # DEPENDENCY PARSING SERVICE (Port 8002) - CPU-only
   # =============================================================================
   dp-service:
     build:
@@ -75,23 +71,19 @@ services:
     ports:
       - "8002:8002"
     environment:
-      - CUDA_VISIBLE_DEVICES=${DP_GPU_ID:-0}  # Use env var or default to GPU 0
+      # Force CPU-only mode to free GPU for Event LLM
+      - CUDA_VISIBLE_DEVICES=
     env_file:
       - .env
     volumes:
       - ./config:/app/config:ro
       - ./logs:/app/logs
+      - ./src:/app/src:ro
       - spacy_models:/root/.local/share/spacy
     depends_on:
       redis:
         condition: service_healthy
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    # No GPU reservation - runs on CPU
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
       interval: 30s
@@ -103,24 +95,32 @@ services:
     restart: unless-stopped
 
   # =============================================================================
-  # EVENT LLM SERVICE (Port 8003)
+  # EVENT LLM SERVICE (Port 8003) - Exclusive GPU
   # =============================================================================
   event-llm-service:
     build:
       context: .
       dockerfile: Dockerfile_event_llm
     container_name: nlp-event-llm-service
+    # Required for vLLM inter-process communication
+    shm_size: '16gb'
     ports:
       - "8003:8003"
     environment:
       - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN}
-      - CUDA_VISIBLE_DEVICES=${EVENT_LLM_GPU_ID:-0}  # Use env var or default to GPU 0
-      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # Reduce GPU memory fragmentation
+      # Exclusive GPU access for vLLM
+      - CUDA_VISIBLE_DEVICES=0
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # vLLM-specific environment variables
+      - VLLM_LOGGING_LEVEL=DEBUG
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+      - NCCL_P2P_DISABLE=1
     env_file:
       - .env
     volumes:
       - ./config:/app/config:ro
       - ./logs:/app/logs
+      - ./src:/app/src:ro
       - huggingface_cache:/root/.cache/huggingface
     depends_on:
       redis:
@@ -133,13 +133,13 @@ services:
               count: 1
               capabilities: [gpu]
         limits:
-          memory: 20G
+          memory: 24G
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 120s
+      start_period: 180s
     networks:
       - nlp-network
     restart: unless-stopped
