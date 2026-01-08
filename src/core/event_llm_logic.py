@@ -82,14 +82,56 @@ class EventLLMModel:
         else:
             self._load_hf_model()
 
+    def _log_gpu_state(self, phase: str):
+        """Log GPU memory state for debugging vLLM initialization."""
+        try:
+            if torch.cuda.is_available():
+                device = torch.cuda.current_device()
+                total = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+                allocated = torch.cuda.memory_allocated(device) / (1024**3)
+                reserved = torch.cuda.memory_reserved(device) / (1024**3)
+                free = total - reserved
+                logger.info(
+                    f"[GPU STATE - {phase}] Total: {total:.2f}GB, Allocated: {allocated:.2f}GB, "
+                    f"Reserved: {reserved:.2f}GB, Free: {free:.2f}GB",
+                    extra={
+                        "phase": phase,
+                        "gpu_total_gb": round(total, 2),
+                        "gpu_allocated_gb": round(allocated, 2),
+                        "gpu_reserved_gb": round(reserved, 2),
+                        "gpu_free_gb": round(free, 2)
+                    }
+                )
+            else:
+                logger.warning(f"[GPU STATE - {phase}] CUDA not available")
+        except Exception as e:
+            logger.error(f"[GPU STATE - {phase}] Failed to get GPU state: {e}")
+
     def _load_vllm_model(self):
         """Load model with vLLM for optimized inference."""
-        logger.info("Loading model with vLLM...")
+        import os
+        import time
+
+        logger.info("=" * 60)
+        logger.info("STARTING vLLM MODEL INITIALIZATION")
+        logger.info("=" * 60)
+
+        # Log environment
+        logger.info(
+            "Environment check",
+            extra={
+                "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "not set"),
+                "VLLM_LOGGING_LEVEL": os.environ.get("VLLM_LOGGING_LEVEL", "not set"),
+                "PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "not set"),
+            }
+        )
+
+        self._log_gpu_state("PRE_INIT")
 
         try:
-            # Load tokenizer first and configure it properly
-            # This must be done before vLLM initialization to avoid tokenizer issues
-            logger.info("Loading and configuring tokenizer...")
+            # Phase 1: Load tokenizer
+            phase_start = time.time()
+            logger.info("[PHASE 1/4] Loading and configuring tokenizer...")
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     self.settings.model_name,
@@ -110,12 +152,11 @@ class EventLLMModel:
                     self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
                     logger.info(f"Set pad_token to eos_token: {self.tokenizer.eos_token}")
                 else:
-                    # Fallback: use a special token or add a new one
                     self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
                     logger.info("Added new pad_token: [PAD]")
 
             logger.info(
-                "Tokenizer configured",
+                f"[PHASE 1/4] Tokenizer loaded in {time.time() - phase_start:.2f}s",
                 extra={
                     "vocab_size": len(self.tokenizer),
                     "pad_token": self.tokenizer.pad_token,
@@ -124,9 +165,12 @@ class EventLLMModel:
                     "eos_token_id": self.tokenizer.eos_token_id
                 }
             )
+            self._log_gpu_state("POST_TOKENIZER")
 
-            # Build vLLM arguments conditionally
-            # Disable prefix caching to prevent potential hangs with resource lifecycle
+            # Phase 2: Build vLLM arguments
+            phase_start = time.time()
+            logger.info("[PHASE 2/4] Building vLLM engine arguments...")
+
             vllm_kwargs = {
                 "model": self.settings.model_name,
                 "tensor_parallel_size": self.settings.tensor_parallel_size,
@@ -136,7 +180,8 @@ class EventLLMModel:
                 "dtype": self.settings.dtype,
                 "swap_space": self.settings.swap_space_gb,
                 "trust_remote_code": True,
-                "disable_log_stats": False,  # Keep logging for debugging
+                "disable_log_stats": False,
+                "enforce_eager": True,  # Disable CUDA graphs to prevent initialization hang
             }
 
             # Explicitly disable prefix caching to avoid conflicts with resource lifecycle
@@ -145,17 +190,59 @@ class EventLLMModel:
                 from vllm.entrypoints.llm import EngineArgs
                 if 'enable_prefix_caching' in inspect.signature(EngineArgs.__init__).parameters:
                     vllm_kwargs["enable_prefix_caching"] = False
-                    logger.info("Prefix caching explicitly disabled to prevent hang")
+                    logger.info("Prefix caching explicitly disabled")
             except Exception as param_check_error:
                 logger.debug(f"Could not check for enable_prefix_caching support: {param_check_error}")
 
-            logger.info("Initializing vLLM engine...")
+            logger.info(
+                f"[PHASE 2/4] vLLM kwargs prepared",
+                extra={
+                    "model": self.settings.model_name,
+                    "tensor_parallel_size": vllm_kwargs["tensor_parallel_size"],
+                    "gpu_memory_utilization": vllm_kwargs["gpu_memory_utilization"],
+                    "max_model_len": vllm_kwargs["max_model_len"],
+                    "enforce_eager": vllm_kwargs["enforce_eager"],
+                    "quantization": vllm_kwargs["quantization"],
+                }
+            )
+
+            # Phase 3: Initialize vLLM engine (this is where hang typically occurs)
+            phase_start = time.time()
+            logger.info("[PHASE 3/4] Initializing vLLM engine (this may take 30-120 seconds)...")
+            logger.info(">>> If hang occurs here, check: shared memory, GPU memory, CUDA graphs")
+
             self.model = LLM(**vllm_kwargs)
 
-            logger.info("vLLM model loaded successfully")
+            logger.info(f"[PHASE 3/4] vLLM engine initialized in {time.time() - phase_start:.2f}s")
+            self._log_gpu_state("POST_ENGINE_INIT")
+
+            # Phase 4: Verify model is ready with a warmup generation
+            phase_start = time.time()
+            logger.info("[PHASE 4/4] Verifying model with warmup generation...")
+
+            warmup_prompt = "Hello, world!"
+            warmup_params = SamplingParams(max_tokens=5, temperature=0.1)
+            warmup_output = self.model.generate([warmup_prompt], warmup_params)
+
+            if warmup_output and warmup_output[0].outputs:
+                logger.info(
+                    f"[PHASE 4/4] Warmup completed in {time.time() - phase_start:.2f}s",
+                    extra={"warmup_output_len": len(warmup_output[0].outputs[0].text)}
+                )
+            else:
+                logger.warning("[PHASE 4/4] Warmup completed but no output generated")
+
+            self._log_gpu_state("POST_WARMUP")
+
+            logger.info("=" * 60)
+            logger.info("vLLM MODEL INITIALIZATION COMPLETE - SUCCESS")
+            logger.info("=" * 60)
 
         except Exception as e:
-            logger.error(f"Failed to load vLLM model: {e}", exc_info=True)
+            logger.error("=" * 60)
+            logger.error(f"vLLM INITIALIZATION FAILED: {e}")
+            logger.error("=" * 60, exc_info=True)
+            self._log_gpu_state("FAILURE")
             logger.info("Falling back to HuggingFace transformers")
             self.use_vllm = False
             self._load_hf_model()
