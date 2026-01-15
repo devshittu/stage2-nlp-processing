@@ -138,6 +138,12 @@ event_llm_service:
   gpu_memory_utilization: 0.90  # Use 90% of 16GB VRAM - AWQ model is ~4GB, plenty of KV cache room
   max_model_len: 4096  # Full context length - AWQ leaves headroom for KV cache
 
+  # 2026 OPTIMIZATION: vLLM Continuous Batching
+  # Enables internal request batching for better GPU utilization
+  max_num_seqs: 4  # Max concurrent sequences in a batch (default was 256, reduced for stability)
+  enable_chunked_prefill: true  # Enable chunked prefill for long prompts
+  disable_log_stats: false  # Keep stats for debugging
+
   # Quantization for memory efficiency
   quantization: "awq"  # AWQ 4-bit quantization enabled
   # AWQ provides ~99% quality at 4x memory reduction
