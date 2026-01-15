@@ -99,6 +99,18 @@ _model_instance = None
 _resource_manager = None
 _cleanup_hook = None
 
+# =============================================================================
+# Backpressure Control (2026 Best Practice)
+# =============================================================================
+# Track active requests to implement 429 backpressure signaling
+import threading
+import asyncio
+
+_active_requests = 0
+_active_requests_lock = threading.Lock()
+MAX_CONCURRENT_REQUESTS = 2  # Match throttler limit
+BACKPRESSURE_RETRY_AFTER = 15  # Seconds to wait before retry
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -219,6 +231,78 @@ async def health_check():
 
 
 # =============================================================================
+# Kubernetes-style Liveness and Readiness Probes (2026 Best Practice)
+# =============================================================================
+
+@api_v1_router.get(
+    "/live",
+    tags=["Health"],
+    summary="Liveness probe (is process alive?)"
+)
+@app.get(
+    "/live",
+    tags=["Health"],
+    summary="Liveness probe (unversioned)"
+)
+async def liveness_probe():
+    """
+    Kubernetes liveness probe - lightweight check that process is running.
+    Should ALWAYS return 200 if the process is alive (no dependency checks).
+
+    Returns:
+        {"status": "alive"} with 200 OK
+    """
+    return {"status": "alive", "timestamp": datetime.utcnow().isoformat() + "Z"}
+
+
+@api_v1_router.get(
+    "/ready",
+    tags=["Health"],
+    summary="Readiness probe (can handle requests?)"
+)
+@app.get(
+    "/ready",
+    tags=["Health"],
+    summary="Readiness probe (unversioned)"
+)
+async def readiness_probe():
+    """
+    Kubernetes readiness probe - checks if service can handle traffic.
+
+    Returns:
+        200 OK if model loaded AND service has capacity
+        503 Service Unavailable if not ready
+
+    Checks:
+    1. Model is loaded
+    2. Service is not at capacity (backpressure check)
+    """
+    # Check 1: Model loaded?
+    if _model_instance is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Model not loaded - service not ready"
+        )
+
+    # Check 2: At capacity? (backpressure)
+    with _active_requests_lock:
+        if _active_requests >= MAX_CONCURRENT_REQUESTS:
+            raise HTTPException(
+                status_code=503,
+                detail=f"At capacity ({_active_requests}/{MAX_CONCURRENT_REQUESTS}) - not accepting new requests",
+                headers={"Retry-After": str(BACKPRESSURE_RETRY_AFTER)}
+            )
+
+    return {
+        "status": "ready",
+        "model_loaded": True,
+        "active_requests": _active_requests,
+        "max_concurrent": MAX_CONCURRENT_REQUESTS,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
+
+
+# =============================================================================
 # Event Extraction Endpoint
 # =============================================================================
 
@@ -240,21 +324,44 @@ async def extract_events(request: ExtractEventRequest):
 
     Raises:
         HTTPException: If extraction fails or model is not loaded
+        HTTPException(429): If service is at capacity (backpressure)
     """
+    global _active_requests
     start_time = time.time()
     document_id = request.document_id
 
-    logger.info(
-        f"Extracting events from document: {document_id}",
-        extra={
-            "document_id": document_id,
-            "text_length": len(request.text),
-            "has_context": request.context is not None,
-            "domain_hint": request.domain_hint
-        }
-    )
+    # =========================================================================
+    # BACKPRESSURE CHECK: Return 429 if at capacity
+    # =========================================================================
+    with _active_requests_lock:
+        if _active_requests >= MAX_CONCURRENT_REQUESTS:
+            logger.warning(
+                f"Backpressure triggered: {_active_requests} active requests",
+                extra={
+                    "document_id": document_id,
+                    "active_requests": _active_requests,
+                    "max_concurrent": MAX_CONCURRENT_REQUESTS
+                }
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=f"Service at capacity ({_active_requests}/{MAX_CONCURRENT_REQUESTS} requests). Retry later.",
+                headers={"Retry-After": str(BACKPRESSURE_RETRY_AFTER)}
+            )
+        _active_requests += 1
 
     try:
+        logger.info(
+            f"Extracting events from document: {document_id}",
+            extra={
+                "document_id": document_id,
+                "text_length": len(request.text),
+                "has_context": request.context is not None,
+                "domain_hint": request.domain_hint,
+                "active_requests": _active_requests
+            }
+        )
+
         # Validate model is loaded
         if _model_instance is None:
             logger.error("Event LLM model not loaded")
@@ -322,6 +429,14 @@ async def extract_events(request: ExtractEventRequest):
             status_code=500,
             detail=f"Event extraction failed: {str(e)}"
         )
+    finally:
+        # Always decrement active requests counter (backpressure cleanup)
+        with _active_requests_lock:
+            _active_requests -= 1
+            logger.debug(
+                f"Request completed, active requests: {_active_requests}",
+                extra={"active_requests": _active_requests}
+            )
 
 
 # =============================================================================
