@@ -34,6 +34,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed as futures_as_completed
+import threading
 
 # Celery
 from celery import Celery, Task
@@ -67,6 +68,7 @@ from src.core.event_linker import get_event_linker
 from src.storage.backends import MultiBackendWriter
 from src.core.checkpoint_manager import CheckpointManager, CheckpointStatus
 from src.core.resource_lifecycle_manager import get_resource_manager
+from src.core.llm_throttler import get_throttler, ThrottlerConfig
 
 # Metadata registry integration (optional, graceful degradation if unavailable)
 try:
@@ -116,7 +118,10 @@ except Exception as e:
 # =============================================================================
 
 # Worker configuration
-MAX_WORKERS_FALLBACK = min(os.cpu_count() or 4, 8)  # Use up to 8 cores for fallback processing
+# NOTE: Reduced from 8 to 2 to prevent Event LLM queue saturation
+# With semaphore limiting LLM to 2 concurrent requests, 2 workers is optimal
+# NER/DP run in parallel (fast), Event LLM is throttled via semaphore
+MAX_WORKERS_FALLBACK = 2  # Conservative: only 2 parallel workers
 
 # Progress reporting
 BATCH_CHUNK_SIZE = 10  # Log progress every N documents
@@ -131,6 +136,10 @@ DASK_DASHBOARD_PORT = 8787  # Dask dashboard port (if enabled)
 # Timeouts (in seconds)
 HTTP_CLIENT_TIMEOUT = 300  # 5 minutes for downstream service calls
 HTTP_CONNECT_TIMEOUT = 10  # 10 seconds to establish connection
+
+# Event LLM Throttler configuration
+# Limits concurrent Event LLM requests to prevent vLLM queue saturation
+EVENT_LLM_MAX_CONCURRENT = 2  # Max simultaneous Event LLM requests (vLLM is single-threaded)
 
 # =============================================================================
 # Event Linker Cache (only non-HTTP service)
@@ -411,22 +420,21 @@ def process_single_document_pipeline(
             soa_triplets = [SOATriplet(**t) for t in dp_data.get("soa_triplets", [])]
             logger.debug(f"[{document_id}] DP extracted {len(soa_triplets)} triplets")
 
-        # Step 3: Event LLM Extraction via HTTP (with vLLM!) with retries
-        logger.debug(f"[{document_id}] Calling Event LLM service (vLLM)")
-        with httpx.Client(timeout=HTTP_CLIENT_TIMEOUT) as client:
-            event_data = make_request_with_retry(
-                client,
-                EVENT_LLM_SERVICE_URL,
-                {
-                    "text": text,
-                    "document_id": document_id,
-                    "entities": [e.model_dump() for e in entities],
-                    "context": context
-                },
-                "Event LLM"
-            )
-            events = [Event(**e) for e in event_data.get("events", [])]
-            logger.debug(f"[{document_id}] Event LLM extracted {len(events)} events")
+        # Step 3: Event LLM Extraction via THROTTLED HTTP (with vLLM!)
+        # Uses semaphore-based throttling to prevent queue saturation
+        logger.debug(f"[{document_id}] Calling Event LLM service (vLLM) via throttler")
+        throttler = get_throttler(ThrottlerConfig(
+            max_concurrent_requests=EVENT_LLM_MAX_CONCURRENT,
+            http_timeout=HTTP_CLIENT_TIMEOUT
+        ))
+        event_data = throttler.extract_events_single(
+            text=text,
+            document_id=document_id,
+            entities=[e.model_dump() for e in entities],
+            context=context
+        )
+        events = [Event(**e) for e in event_data.get("events", [])]
+        logger.debug(f"[{document_id}] Event LLM extracted {len(events)} events")
 
         # Calculate processing time
         end_time = datetime.utcnow()
@@ -844,7 +852,7 @@ def process_document_task(self, document_json: str) -> Dict[str, Any]:
         }
 
 
-@app.task(name="process_batch_task", bind=True)
+@app.task(name="process_batch_task", bind=True, acks_late=True)
 def process_batch_task(
     self,
     documents: List[Dict[str, Any]],
@@ -862,6 +870,11 @@ def process_batch_task(
     5. Assign storyline IDs
     6. Save to storage backends
     7. Return summary statistics
+
+    Features:
+    - Task idempotency: Prevents duplicate batch processing
+    - acks_late=True: Task acknowledged only after completion
+    - Checkpoint-based resume: Can resume from failure
 
     Args:
         documents: List of Stage1Document dictionaries
@@ -883,6 +896,29 @@ def process_batch_task(
         f"Starting batch processing task: {task_id}",
         extra={"task_id": task_id, "batch_id": batch_id}
     )
+
+    # ==========================================================================
+    # IDEMPOTENCY CHECK: Prevent duplicate batch processing
+    # ==========================================================================
+    # Check if this batch_id has already been completed successfully
+    # This prevents batch fragmentation from duplicate task submissions
+    try:
+        import redis
+        idempotency_key = f"stage2:batch:completed:{batch_id}"
+        redis_client = redis.Redis.from_url(
+            os.environ.get("REDIS_CACHE_URL", "redis://redis:6379/1"),
+            decode_responses=True
+        )
+        existing_result = redis_client.get(idempotency_key)
+        if existing_result:
+            logger.warning(
+                f"Batch {batch_id} already completed, returning cached result",
+                extra={"batch_id": batch_id, "task_id": task_id}
+            )
+            import json
+            return json.loads(existing_result)
+    except Exception as e:
+        logger.warning(f"Idempotency check failed (continuing): {e}")
 
     start_time = datetime.utcnow()
     cluster = None
@@ -955,6 +991,17 @@ def process_batch_task(
         # Use cached models (loaded once per worker)
         logger.info("Using cached NLP models")
         storage_writer = MultiBackendWriter(job_id=task_id)
+
+        # Reset throttler metrics for clean per-batch tracking
+        throttler = get_throttler(ThrottlerConfig(
+            max_concurrent_requests=EVENT_LLM_MAX_CONCURRENT,
+            http_timeout=HTTP_CLIENT_TIMEOUT
+        ))
+        throttler.reset_metrics()
+        logger.info(
+            "Event LLM throttler ready",
+            extra={"max_concurrent": EVENT_LLM_MAX_CONCURRENT}
+        )
 
         # Create or load checkpoint for progressive saving and resume capability
         checkpoint = checkpoint_mgr.load_checkpoint(task_id)
@@ -1202,6 +1249,26 @@ def process_batch_task(
         total_events = sum(len(r["events"]) for r in processed_results if r["success"])
         total_entities = sum(len(r["entities"]) for r in processed_results if r["success"])
 
+        # Get throttler and deduplication metrics
+        throttler_metrics = get_throttler().get_metrics()
+        dedup_stats = storage_writer.get_deduplication_stats()
+
+        logger.info(
+            "Throttler metrics",
+            extra={
+                "batch_id": batch_id,
+                **throttler_metrics
+            }
+        )
+
+        logger.info(
+            "Deduplication stats",
+            extra={
+                "batch_id": batch_id,
+                **dedup_stats
+            }
+        )
+
         result = {
             "success": True,
             "batch_id": batch_id,
@@ -1216,6 +1283,8 @@ def process_batch_task(
             "processing_time_ms": total_time_ms,
             "completed_at": end_time.isoformat() + "Z",
             "save_statistics": save_stats,
+            "throttler_metrics": throttler_metrics,
+            "deduplication_stats": dedup_stats,
             "message": f"Processed {documents_processed}/{total_docs} documents successfully"
         }
 
@@ -1285,6 +1354,26 @@ def process_batch_task(
                 logger.info("job_status_updated_to_completed", extra={"job_id": str(task_id)})
             except Exception as e:
                 logger.warning(f"Failed to update job status to completed: {e}")
+
+        # =======================================================================
+        # IDEMPOTENCY: Save result to Redis to prevent duplicate processing
+        # =======================================================================
+        try:
+            import redis
+            import json
+            idempotency_key = f"stage2:batch:completed:{batch_id}"
+            redis_client = redis.Redis.from_url(
+                os.environ.get("REDIS_CACHE_URL", "redis://redis:6379/1"),
+                decode_responses=True
+            )
+            # Cache result for 24 hours (prevents re-processing of same batch)
+            redis_client.setex(idempotency_key, 86400, json.dumps(result))
+            logger.info(
+                f"Batch {batch_id} result cached for idempotency",
+                extra={"batch_id": batch_id, "ttl_hours": 24}
+            )
+        except Exception as e:
+            logger.warning(f"Failed to cache batch result for idempotency: {e}")
 
         return result
 

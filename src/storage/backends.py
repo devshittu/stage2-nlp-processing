@@ -743,28 +743,83 @@ class MultiBackendWriter:
     Writes to multiple storage backends simultaneously.
 
     Failure in one backend does not affect others.
+
+    Features:
+    - Multi-backend simultaneous writes
+    - Deduplication: Prevents duplicate document writes within a session
+    - Thread-safe deduplication tracking
     """
 
-    def __init__(self, backends: Optional[List[StorageBackend]] = None, job_id: Optional[str] = None):
+    def __init__(
+        self,
+        backends: Optional[List[StorageBackend]] = None,
+        job_id: Optional[str] = None,
+        enable_deduplication: bool = True
+    ):
         """
         Initialize with backends.
 
         Args:
             backends: Optional list of pre-configured backends
             job_id: Optional job ID for traceability in output filenames
+            enable_deduplication: If True, prevent duplicate document writes
         """
         self.backends = backends or StorageBackendFactory.create_enabled_backends(job_id=job_id)
         self.job_id = job_id
+        self.enable_deduplication = enable_deduplication
 
-        logger.info(f"MultiBackendWriter initialized with {len(self.backends)} backends")
+        # Deduplication: Track written document IDs (thread-safe)
+        import threading
+        self._written_doc_ids: set = set()
+        self._dedup_lock = threading.Lock()
+        self._duplicate_count = 0
+
+        logger.info(
+            f"MultiBackendWriter initialized with {len(self.backends)} backends",
+            extra={"deduplication_enabled": enable_deduplication}
+        )
+
+    def _is_duplicate(self, document_id: str) -> bool:
+        """Check if document has already been written."""
+        if not self.enable_deduplication:
+            return False
+
+        with self._dedup_lock:
+            if document_id in self._written_doc_ids:
+                self._duplicate_count += 1
+                logger.warning(
+                    f"Duplicate document detected, skipping: {document_id}",
+                    extra={"document_id": document_id, "duplicate_count": self._duplicate_count}
+                )
+                return True
+            return False
+
+    def _mark_written(self, document_id: str):
+        """Mark document as written to prevent future duplicates."""
+        if self.enable_deduplication:
+            with self._dedup_lock:
+                self._written_doc_ids.add(document_id)
+
+    def get_deduplication_stats(self) -> Dict[str, Any]:
+        """Get deduplication statistics."""
+        with self._dedup_lock:
+            return {
+                "documents_written": len(self._written_doc_ids),
+                "duplicates_prevented": self._duplicate_count,
+                "deduplication_enabled": self.enable_deduplication
+            }
 
     def save(self, document: ProcessedDocument) -> Dict[str, bool]:
         """
-        Save document to all backends.
+        Save document to all backends with deduplication.
 
         Returns:
             Dict mapping backend class name to success status
         """
+        # Check for duplicate
+        if self._is_duplicate(document.document_id):
+            return {backend.__class__.__name__: False for backend in self.backends}
+
         results = {}
 
         for backend in self.backends:
@@ -772,21 +827,44 @@ class MultiBackendWriter:
             success = backend.save(document)
             results[backend_name] = success
 
+        # Mark as written if at least one backend succeeded
+        if any(results.values()):
+            self._mark_written(document.document_id)
+
         return results
 
     def save_batch(self, documents: List[ProcessedDocument]) -> Dict[str, int]:
         """
-        Save batch to all backends.
+        Save batch to all backends with deduplication.
 
         Returns:
             Dict mapping backend class name to number of documents saved
         """
+        # Filter out duplicates
+        unique_docs = []
+        for doc in documents:
+            if not self._is_duplicate(doc.document_id):
+                unique_docs.append(doc)
+
+        if not unique_docs:
+            logger.info("All documents in batch were duplicates, skipping save")
+            return {backend.__class__.__name__: 0 for backend in self.backends}
+
         results = {}
 
         for backend in self.backends:
             backend_name = backend.__class__.__name__
-            count = backend.save_batch(documents)
+            count = backend.save_batch(unique_docs)
             results[backend_name] = count
+
+        # Mark all unique docs as written
+        for doc in unique_docs:
+            self._mark_written(doc.document_id)
+
+        logger.debug(
+            f"Batch save complete: {len(unique_docs)} unique docs, {len(documents) - len(unique_docs)} duplicates filtered",
+            extra={"unique": len(unique_docs), "duplicates_filtered": len(documents) - len(unique_docs)}
+        )
 
         return results
 
