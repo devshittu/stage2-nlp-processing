@@ -180,8 +180,11 @@ class EventLLMModel:
                 "dtype": self.settings.dtype,
                 "swap_space": self.settings.swap_space_gb,
                 "trust_remote_code": True,
-                "disable_log_stats": False,
+                "disable_log_stats": getattr(self.settings, 'disable_log_stats', False),
                 "enforce_eager": True,  # Disable CUDA graphs to prevent initialization hang
+                # 2026 OPTIMIZATION: Continuous batching for better GPU utilization
+                "max_num_seqs": getattr(self.settings, 'max_num_seqs', 4),  # Max concurrent sequences
+                "enable_chunked_prefill": getattr(self.settings, 'enable_chunked_prefill', True),
             }
 
             # Explicitly disable prefix caching to avoid conflicts with resource lifecycle
